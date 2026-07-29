@@ -11,6 +11,10 @@ Image.__index = Image
 function Image:getDimensions() return self.w, self.h end
 function Image:getWidth() return self.w end
 function Image:getHeight() return self.h end
+-- real Images always answer this; callers that set a per-image filter (the
+-- touch overlay wants linear over the global nearest default) call it right
+-- after newImage, outside the pcall that guards the load
+function Image:setFilter() end
 
 -- read PNG dimensions from the file header (no decoder needed)
 local function pngSize(path)

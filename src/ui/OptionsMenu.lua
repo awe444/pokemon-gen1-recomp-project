@@ -17,6 +17,7 @@ local Zoom = require("src.render.Zoom")
 local TileRenderer = require("src.render.TileRenderer")
 local GameSpeed = require("src.core.GameSpeed")
 local VideoMode = require("src.core.VideoMode")
+local TouchControls = require("src.core.TouchControls")
 local FrameCap = require("src.core.FrameCap")
 local Logger = require("src.core.Logger")
 local Runtime = require("src.mods.Runtime")
@@ -291,6 +292,18 @@ local function buildRows(game)
       activate = function(g)
         require("src.ui.Screens").push(g, "ManagerState")
       end },
+    -- On-screen overlay (mobile only -- filtered out below where there is
+    -- none).  A player on a phone with a controller wants the thumb pad gone
+    -- for good, not just until the next screen touch, which is what the
+    -- automatic controller-hide gives them.
+    { id = "touch", label = Strings("TOUCH"),
+      value = function()
+        return TouchControls.enabled and "ON" or "OFF"
+      end,
+      step = function(g)
+        g.save.options.touch = TouchControls:setEnabled(not TouchControls.enabled)
+        return true
+      end },
     -- rebinding UI (gap C2, 12-ui-extensibility 4.4); captured inputs
     -- live in options.bindings, so the row costs a vanilla install nothing
     { id = "controls", label = Strings("CONTROLS"),
@@ -298,6 +311,14 @@ local function buildRows(game)
         require("src.ui.Screens").push(g, "BindingsMenu")
       end },
   }
+  -- No overlay on this platform (desktop): the row would be a dead toggle.
+  if not TouchControls.supported() then
+    local filtered = {}
+    for _, row in ipairs(rows) do
+      if row.id ~= "touch" then filtered[#filtered + 1] = row end
+    end
+    rows = filtered
+  end
   -- issue #136: hide GBC FX on Android/iOS -- the present shader soft-bricks
   if not GBCFX.isSupported() then
     local filtered = {}

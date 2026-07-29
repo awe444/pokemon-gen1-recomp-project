@@ -60,6 +60,30 @@ local function wantsOverlay()
   return osName == "Android" or osName == "iOS"
 end
 
+-- Whether this platform has the overlay at all -- what decides if the OPTIONS
+-- row is worth showing.  Separate from `enabled` (the player's choice), which
+-- only has meaning where this is true.
+function TouchControls.supported()
+  return wantsOverlay()
+end
+
+-- The player's TOUCH option.  Default on: a phone with no controller has no
+-- other way to play, so the overlay may only disappear when it is asked to.
+-- Kept live rather than folded into `active` at init, so toggling the row
+-- takes effect on the next frame without reloading the art.
+TouchControls.enabled = true
+
+function TouchControls.applyOptions(opts)
+  local want = opts and opts.touch
+  TouchControls.enabled = want == nil or want and true or false
+end
+
+function TouchControls:setEnabled(on)
+  self.enabled = on and true or false
+  if not self.enabled then self:reset() end
+  return self.enabled
+end
+
 function TouchControls:init()
   self.active = wantsOverlay()
   self.controllerHidden = false
@@ -88,7 +112,8 @@ function TouchControls:init()
 end
 
 function TouchControls:visible()
-  return self.active and self.img ~= nil and not self.controllerHidden
+  return self.active and self.enabled and self.img ~= nil
+    and not self.controllerHidden
 end
 
 -- Layout in LOVE units (density-independent on mobile), recomputed when
@@ -165,7 +190,9 @@ local function setDpad(self, touch, dir)
 end
 
 function TouchControls:touchpressed(id, x, y)
-  if not (self.active and self.img) then return end
+  -- `enabled` gates input as well as the draw: an invisible overlay must not
+  -- keep swallowing taps as button presses.
+  if not (self.active and self.enabled and self.img) then return end
   -- a controller hid the overlay; the first touch only brings it back
   if self.controllerHidden then
     self.controllerHidden = false

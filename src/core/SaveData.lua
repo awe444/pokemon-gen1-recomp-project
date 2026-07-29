@@ -210,6 +210,10 @@ function SaveData.defaultOptions()
     voidFill = "trees",
     -- windowed | borderless (desktop fullscreen); ignored on mobile
     videoMode = "windowed",
+    -- on-screen touch overlay (mobile only; OptionsMenu TOUCH row).  On by
+    -- default -- a phone with no controller has no other input -- so it only
+    -- goes away when the player asks (src/core/TouchControls.lua).
+    touch = true,
     -- hard render frame-rate cap; render-only pacing (issue #88, FrameCap.lua)
     fpsCap = 60,
     -- Per-pipeline display levels, keyed by render_pipelines id (see

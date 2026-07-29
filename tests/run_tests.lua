@@ -3177,6 +3177,12 @@ runSuites({ "tests/rom_importer_android_pick_test.lua" })
 
 -- ---------------------------------------------- Android mod / save SAF pick
 runSuites({ "tests/rom_importer_android_mod_pick_test.lua" })
+
+-- ---------------------------------------------- Android autoboot
+runSuites({ "tests/rom_importer_autoboot_test.lua" })
+
+-- ---------------------------------------------- touch overlay option
+runSuites({ "tests/touch_controls_option_test.lua" })
 -- ---------------------------------------------- parity workstream tests
 -- Each tests/parity_*.lua is a self-contained file (own bootstrap + check,
 -- error()s if any assertion fails).  Globbed, so dropping a new parity
