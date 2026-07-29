@@ -123,7 +123,27 @@ function love.load(args)
     return
   end
 
-  -- Interactive: the launcher always runs.  Red and Blue are each live: a
+  -- Android autoboot: an imported cart left in the save directory means this
+  -- device is already provisioned, so go straight into that game and skip the
+  -- launcher.  This is the normal launch on a phone -- the launcher is a
+  -- first-run / re-provisioning screen there, not a per-launch gate.  Mods
+  -- need no special handling: bootGame is the same entry the launcher's Play
+  -- button calls, and the loader restores each mod's enabled state from the
+  -- persisted options on every boot.
+  --
+  -- Only autoboot with the cache actually ready.  When the ROM is present but
+  -- its extracted data is missing or stale (a fresh install over old files, an
+  -- app update that bumps the cache format), fall through to the launcher: it
+  -- picks the same ROM up automatically and shows extraction progress, which
+  -- beats a minute of blank screen, and leaves the player somewhere they can
+  -- recover from if that ROM turns out to be unreadable.
+  local autoVersion = not forceImport and RomImporter.autobootVersion() or nil
+  if autoVersion and RomImporter.isReady(autoVersion) then
+    bootGame(autoVersion)
+    return
+  end
+
+  -- Interactive: the launcher runs.  Red and Blue are each live: a
   -- column shows Play when that game's ROM is already imported, or Choose ROM
   -- / drag-drop when it is not (Yellow is still a placeholder).  Any dropped
   -- .gb is routed to Red or Blue by its SHA-1; pressing Play boots that game.
@@ -352,6 +372,26 @@ function love.run()
       for name, a, b, c, d, e, f in love.event.poll() do
         if name == "quit" then
           if not love.quit or not love.quit() then
+            -- Android: ending the SDL thread finishes the activity but leaves
+            -- the process warm, and liblove only releases PhysFS in the
+            -- filesystem module's destructor -- which that path never runs.
+            -- Android then hands the next launch the SAME process ("Already
+            -- Exists in BG"), liblove re-runs boot.lua, and PHYSFS_init
+            -- fails: "Failed to initialize filesystem: already initialized".
+            -- The app appears to launch and instantly die, and only starts
+            -- again once it is swiped out of Recents (which kills the
+            -- process).  Ending the process ourselves makes every launch a
+            -- cold one.  Runs after love.quit() above, so shutdown work
+            -- (Discord presence) still happens.
+            --
+            -- "restart" must NOT take this path: love.event.quit("restart")
+            -- deliberately re-enters boot inside the running process to apply
+            -- a mod toggle or hand off from the importer, and liblove tears
+            -- the Lua state (and so the filesystem module) down for it.
+            if a ~= "restart" and love.system
+               and love.system.getOS() == "Android" then
+              os.exit(type(a) == "number" and a or 0)
+            end
             return a or 0
           end
         end

@@ -271,21 +271,66 @@ end
 -- via USB or a file manager, no runtime permission needed), and this scans
 -- it directly through love.filesystem -- already mounted at the physfs
 -- root, so no io.* absolute-path handling is needed.
---
+
+-- The save-dir basename GameActivity writes every SAF pick to.  Also the
+-- autoboot marker: startData deliberately leaves it in place after a
+-- successful import (see autobootVersion below).
+local AUTOBOOT_ROM = "picked_rom.gb"
+
+-- Read one save-dir .gb and route it by SHA-1.  Returns version, data, or nil
+-- when the file is absent, unreadable, not cart-sized, or not a cart we know.
+local function romAt(name)
+  if not love.filesystem.getInfo(name, "file") then return nil end
+  local data = love.filesystem.read(name)
+  if type(data) ~= "string" or #data ~= 1024 * 1024 then return nil end
+  local version = GameVersion.forSha1(sha1(data))
+  if not version then return nil end
+  return version, data
+end
+
 -- Only a .gb whose SHA maps to a version that is not yet ready counts as
 -- pending.  GameActivity always writes the SAF pick to picked_rom.gb, so a
 -- naive "first .gb wins" scan would re-import Red when the player tries to
--- add Blue (issue #167).
+-- add Blue (issue #167).  That readiness filter is also what lets an imported
+-- cart stay on disk as the autoboot marker without re-importing every launch.
 local function findPendingRom(ready)
   for _, name in ipairs(love.filesystem.getDirectoryItems("")) do
-    if name:lower():match("%.gb$") and love.filesystem.getInfo(name, "file") then
-      local data = love.filesystem.read(name)
-      if type(data) == "string" and #data == 1024 * 1024 then
-        local version = GameVersion.forSha1(sha1(data))
-        if version and not ready[version] then
-          return name, data
-        end
+    if name:lower():match("%.gb$") then
+      local version, data = romAt(name)
+      if version and not ready[version] then
+        return name, data
       end
+    end
+  end
+  return nil
+end
+
+-- Android autoboot: which game to launch straight into, skipping the
+-- launcher, or nil to show the launcher.
+--
+-- The provisioning marker is the imported cart itself, left in the save
+-- directory by startData.  Its presence means "this device already has a ROM,
+-- go play it"; deleting it is how the player gets the launcher back to pick a
+-- ROM again (or to reach the MODS / save-slot panels).  Routing by SHA-1
+-- rather than a remembered setting keeps the file the single source of truth,
+-- so a cart swapped in over USB is honored on the next launch with no stale
+-- state to clear.  picked_rom.gb wins over any other .gb so the last real SAF
+-- pick outranks a leftover USB copy.
+--
+-- Desktop is unaffected (the launcher's ROM columns and Play button are the
+-- whole point there); POKEPORT_AUTOBOOT=1 forces this path on for desktop
+-- testing, the same way POKEPORT_TOUCH=1 exercises the mobile controls.
+function RomImporter.autobootVersion()
+  local android = love.system and love.system.getOS
+    and love.system.getOS() == "Android"
+  if not (android or os.getenv("POKEPORT_AUTOBOOT") == "1") then return nil end
+  if not love.filesystem.getDirectoryItems then return nil end
+  local version = romAt(AUTOBOOT_ROM)
+  if version then return version, AUTOBOOT_ROM end
+  for _, name in ipairs(love.filesystem.getDirectoryItems("")) do
+    if name ~= AUTOBOOT_ROM and name:lower():match("%.gb$") then
+      version = romAt(name)
+      if version then return version, name end
     end
   end
   return nil
@@ -667,12 +712,16 @@ function RomImporter:startData(data, displayName)
     self.returning[version] = false
     self.romName[version] = (displayName
       and (displayName:match("[^/\\]+$") or displayName)) or self.romName[version]
-    -- Android: drop the consumed save-dir .gb (picked_rom.gb or a USB copy)
-    -- so the next Choose / focus cannot treat it as a fresh pending ROM.
-    if self.android and type(displayName) == "string"
-        and not displayName:find("[/\\]") then
-      love.filesystem.remove(displayName)
-    end
+    -- Android: KEEP the imported save-dir .gb (picked_rom.gb or a USB copy).
+    -- It is the autoboot marker RomImporter.autobootVersion() looks for, so
+    -- the next launch goes straight into this game instead of the launcher.
+    -- Deleting it is the player's way back to the launcher.
+    --
+    -- It used to be removed here so a later Choose / focus could not mistake
+    -- it for a fresh pending ROM; findPendingRom is what actually prevents
+    -- that (it skips any cart whose version is already ready -- issue #167),
+    -- and that guard is unchanged.  Keeping the file also means a cache
+    -- invalidated by an app update re-extracts from it with no re-pick.
     self.importing = nil
     self.workState = "complete"
     self.completeVersion = version

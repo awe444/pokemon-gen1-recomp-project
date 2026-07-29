@@ -50,6 +50,55 @@ chosen file under the app save directory as `picked_rom.gb`,
 from that folder on Choose / refocus; see `docs/launcher.md`. The APK payload
 itself remains data-free (no embedded ROM or generated cache).
 
+### Autoboot
+
+The imported cart is **kept** in the save directory, and its presence is what
+makes the next launch skip the launcher and go straight into that game
+(`RomImporter.autobootVersion`, called from `main.lua`). The launcher is a
+first-run / re-provisioning screen on a phone, not a per-launch gate.
+
+- **First run** — no `.gb` in the save directory, so the launcher comes up to
+  import a ROM and set up mods.
+- **Provisioned** — `picked_rom.gb` (or any save-dir `.gb`) is routed by SHA-1
+  and that game boots directly, with whatever mods were left enabled; the mod
+  loader restores enable state from the persisted options on every boot, so
+  autoboot needs no special handling for them.
+- **Back to the launcher** — delete the `.gb`. That is also the way back to the
+  MODS tab, the save-slot picker, and ROM re-import.
+- **Stale cache** — ROM present but its extracted data missing or from an older
+  cache format (e.g. after an app update): the launcher runs, picks that same
+  ROM up automatically, shows extraction progress, and one Play tap resumes
+  normal autoboot afterwards.
+
+Both games imported: the marker is whichever ROM file is on disk, with
+`picked_rom.gb` preferred, so the last cart picked is the one that autoboots.
+
+Desktop is unaffected — the launcher's ROM columns and Play button are the
+point there. `POKEPORT_AUTOBOOT=1 love .` forces the autoboot path on for
+desktop testing, the way `POKEPORT_TOUCH=1` exercises the mobile controls.
+
+### Quitting must end the process
+
+`love.run` in `main.lua` calls `os.exit` on a real (non-`"restart"`) quit when
+`love.system.getOS() == "Android"`. **Do not remove it.** Ending the SDL thread
+finishes the activity but leaves the process warm, and liblove only releases
+PhysFS in the filesystem module's destructor, which that path never runs
+(`love/src/jni/love/src/modules/filesystem/physfs/Filesystem.cpp`). Android
+then gives the next launch the same process:
+
+```
+ActivityTaskManager: The Process com.theboisclub.pokemonred Already Exists in BG. So sending its PID: 10056
+SDL/APP: [LOVE] Error: [love "boot.lua"]:48: Failed to initialize filesystem: already initialized
+```
+
+The app appears to launch and instantly die, and only starts again after being
+swiped out of Recents. Autoboot makes launch → play → exit → relaunch the
+everyday loop, so this is hit constantly without the hard exit.
+
+`"restart"` quits (mod toggle, importer hand-off) deliberately re-enter boot
+inside the running process and are excluded — liblove tears the Lua state, and
+so the filesystem module, down for those.
+
 ### SDK / NDK
 
 love-android 11.5a expects:
