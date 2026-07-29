@@ -37,7 +37,11 @@ function DexEntryMenu.new(game, speciesOrOpts)
   self.def = game.data.pokemon[species]
   local path = require("src.pokemon.Sprites").path(game.data, species, "front",
     { kind = "dex" })
-  local ok, img = path and pcall(love.graphics.newImage, path)
+  -- `local ok, img = path and pcall(...)` reads like a guarded call but an
+  -- and-expression is truncated to ONE value, so img was ALWAYS nil and the
+  -- entry never drew its sprite.  Guard with a statement instead.
+  local ok, img = false, nil
+  if path then ok, img = pcall(love.graphics.newImage, path) end
   self.sprite = ok and img or nil
   require("src.core.Sound").playCry(game.data, species)
   return self

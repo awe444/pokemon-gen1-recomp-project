@@ -162,7 +162,11 @@ function Loader:_loadState()
   if next(options.mods or {}) == nil and self.fs.getInfo
       and self.fs.getInfo(MOD_STATE_FILE) then
     local chunk = self.fs.load(MOD_STATE_FILE)
-    local ok, state = chunk and pcall(chunk)
+    -- and-expressions truncate to one value, so `local ok, state = chunk and
+    -- pcall(chunk)` left state nil and this migration silently did nothing
+    -- (same trap as DexEntryMenu's sprite load).  Guard with a statement.
+    local ok, state = false, nil
+    if chunk then ok, state = pcall(chunk) end
     if ok and type(state) == "table" then
       for id, disabled in pairs(state) do
         if disabled then
