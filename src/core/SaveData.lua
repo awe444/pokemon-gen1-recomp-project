@@ -320,8 +320,15 @@ function SaveData.defaultOptions()
     -- src/core/FaithfulRes.lua.  Ignored on mobile.
     faithfulRes = 0,
     -- render scale derived from a fixed logical frame instead of the 160x144
-    -- UI ("auto" = the original behavior); see src/render/LogicalRes.lua
-    logicalRes = "auto",
+    -- UI ("auto" = upstream's behavior); see src/render/LogicalRes.lua.  This
+    -- fork ships the 320x240 frame on by default: the target handheld's panel
+    -- is exactly 1280x960, a whole 4x of it.
+    logicalRes = "320x240",
+    -- Android autoboot pin (src/import/RomImporter.lua).  "auto" boots the one
+    -- imported cart and shows the launcher when there are several; this fork
+    -- names Blue outright so the target device is deterministic even after a
+    -- second cart is imported.  Ignored on desktop.
+    autoboot = "blue",
     screenPos = "center",
     -- hard render frame-rate cap; render-only pacing (issue #88, FrameCap.lua)
     fpsCap = 60,

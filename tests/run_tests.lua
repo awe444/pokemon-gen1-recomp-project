@@ -3777,6 +3777,9 @@ runSuites({ "tests/rom_importer_android_pick_test.lua" })
 -- ---------------------------------------------- Android mod / save SAF pick
 runSuites({ "tests/rom_importer_android_mod_pick_test.lua" })
 
+-- ---------------------------------------------- Android autoboot
+runSuites({ "tests/rom_importer_autoboot_test.lua" })
+
 -- ---------------------------------------------- fixed logical frame scaling
 runSuites({ "tests/logical_res_test.lua" })
 

@@ -755,6 +755,27 @@ function love.load(args)
     LaunchOptions.pendingTab = resolvedLaunch.game
   end
 
+  -- ANDROID AUTOBOOT: nothing above asked for a game, so a provisioned phone
+  -- goes straight into the one it holds (src/import/RomImporter.lua).  Routed
+  -- through startLaunchRequest rather than bootGame so it inherits everything
+  -- a --game shortcut already gets: the readiness check that falls back to the
+  -- launcher, the Prelaunch screen, and launchedIntoGame -- which is what
+  -- makes a window close exit instead of restarting into the same game
+  -- forever (#887).  `relaunched` gates it so quit-to-launcher still lands on
+  -- the launcher for exactly one boot.
+  if not relaunched and not resolvedLaunch.game then
+    -- options.lua only, the same standalone read applySavedOrientation does;
+    -- no save slot is loaded this early
+    local okOpts, savedOptions = pcall(function()
+      return require("src.core.SaveData").loadOptions()
+    end)
+    local autoVersion = require("src.import.RomImporter")
+      .autobootVersion(okOpts and savedOptions or nil)
+    if autoVersion and startLaunchRequest({ game = autoVersion }) then
+      return
+    end
+  end
+
   -- Interactive: the launcher always runs.  Red, Blue, Yellow, and Gold are
   -- each live: a column shows Play when that game's ROM is already imported,
   -- or Choose ROM / drag-drop when it is not.  Any dropped .gb/.gbc is routed

@@ -195,6 +195,49 @@ function RomImporter.isReady(version)
   return CacheContract.isReady(version, CacheFs)
 end
 
+-- Every version whose ROM is imported and cached, in GameVersion.ORDER.
+function RomImporter.readyVersions()
+  local ready = {}
+  for _, v in ipairs(GameVersion.ORDER) do
+    if RomImporter.isReady(v) then ready[#ready + 1] = v end
+  end
+  return ready
+end
+
+-- ANDROID AUTOBOOT: the version to launch straight into, or nil to show the
+-- launcher.
+--
+-- On a phone the launcher is a first-run / re-provisioning screen, not a
+-- per-launch gate: there is no window to leave open and no mouse to pick a
+-- column with, so a device that already holds exactly one imported cart has
+-- nothing to ask about.  Desktop is unaffected -- the launcher's ROM columns
+-- and Play button are the whole point there -- and POKEPORT_AUTOBOOT=1 forces
+-- the path on for desktop testing, the way POKEPORT_TOUCH=1 exercises the
+-- mobile controls.
+--
+-- The imported cache is the marker, not a file left in the save directory:
+-- the importer deletes the consumed cart, so cache readiness is the only
+-- durable signal, and clearing a game's data is how the player gets the
+-- launcher back (as is quit-to-launcher, which suppresses this for exactly
+-- one boot through the relaunch marker main.lua consumes).
+--
+-- With several carts imported there IS something to ask, so the launcher runs
+-- -- unless options.autoboot names one, which pins a device to that game.
+function RomImporter.autobootVersion(options)
+  local osName = love.system and love.system.getOS and love.system.getOS()
+  if osName ~= "Android" and os.getenv("POKEPORT_AUTOBOOT") ~= "1" then
+    return nil
+  end
+  local pinned = type(options) == "table" and options.autoboot or nil
+  if type(pinned) == "string" and pinned ~= "" and pinned ~= "auto" then
+    -- a pin for a game that is not imported falls through to the launcher,
+    -- which is where the player fixes exactly that
+    return RomImporter.isReady(pinned) and pinned or nil
+  end
+  local ready = RomImporter.readyVersions()
+  return #ready == 1 and ready[1] or nil
+end
+
 function RomImporter.syncAndroidShortcuts(activeVersion)
   if not (love.system and love.system.getOS and love.system.getOS() == "Android"
       and love.system.updateShortcuts) then
