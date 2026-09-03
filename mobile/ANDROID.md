@@ -50,65 +50,60 @@ chosen file under the app save directory as `picked_rom.gb`,
 from that folder on Choose / refocus; see `docs/launcher.md`. The APK payload
 itself remains data-free (no embedded ROM or generated cache).
 
-### Autoboot
+### Step bridge (Pokéwalker mod)
 
-The imported cart is **kept** in the save directory, and its presence is what
-makes the next launch skip the launcher and go straight into that game
-(`RomImporter.autobootVersion`, called from `main.lua`). The launcher is a
-first-run / re-provisioning screen on a phone, not a per-launch gate.
+`love.system.syncHealthSteps()` → `GameActivity.syncHealthSteps` (same
+JNI route as the picker: `common/android.cpp` →
+`modules/system/System.cpp` → `wrap_System.cpp`). The Java side does a
+one-shot read of the hardware `TYPE_STEP_COUNTER` sensor (cumulative
+since boot, counted by the OS whether or not any app runs), anchors the
+reading in `SharedPreferences` so a walk is never credited twice
+(a reading below the anchor means the phone rebooted → re-anchor without
+crediting), and stages the delta as `steps_pending.json` in the save
+identity dir — the same contract as the iOS `GRHealthBridge`. Nothing in
+the base game calls it; the consumer is the
+[Pokéwalker mod](https://github.com/mresnick67/Gen1ReComp-Pokewalker),
+installed as a mod `.zip` at runtime (its SYNC STEPS option defaults
+off).
 
-- **First run** — no `.gb` in the save directory, so the launcher comes up to
-  import a ROM and set up mods.
-- **Provisioned** — `picked_rom.gb` (or any save-dir `.gb`) is routed by SHA-1
-  and that game boots directly, with whatever mods were left enabled; the mod
-  loader restores enable state from the persisted options on every boot, so
-  autoboot needs no special handling for them.
-- **Back to the launcher** — delete the `.gb`. That is also the way back to the
-  MODS tab, the save-slot picker, and ROM re-import.
-- **Stale cache** — ROM present but its extracted data missing or from an older
-  cache format (e.g. after an app update): the launcher runs, picks that same
-  ROM up automatically, shows extraction progress, and one Play tap resumes
-  normal autoboot afterwards.
+Android 10+ gates the sensor behind the `ACTIVITY_RECOGNITION` runtime
+permission (declared in `app/src/main/AndroidManifest.xml`; keep it out
+of the build script's permission trim). The first
+`syncHealthSteps()` call shows the system prompt; on grant the sensor
+read runs immediately (`onRequestPermissionsResult`,
+`STEP_PERMISSION_REQUEST_CODE`).
 
-Both games imported: the marker is whichever ROM file is on disk, with
-`picked_rom.gb` preferred, so the last cart picked is the one that autoboots.
+### Network transport (mod index / mod updates)
 
-Desktop is unaffected — the launcher's ROM columns and Play button are the
-point there. `POKEPORT_AUTOBOOT=1 love .` forces the autoboot path on for
-desktop testing, the way `POKEPORT_TOUCH=1` exercises the mobile controls.
-
-### Quitting must end the process
-
-`love.run` in `main.lua` calls `os.exit` on a real (non-`"restart"`) quit when
-`love.system.getOS() == "Android"`. **Do not remove it.** Ending the SDL thread
-finishes the activity but leaves the process warm, and liblove only releases
-PhysFS in the filesystem module's destructor, which that path never runs
-(`love/src/jni/love/src/modules/filesystem/physfs/Filesystem.cpp`). Android
-then gives the next launch the same process:
-
-```
-ActivityTaskManager: The Process com.theboisclub.pokemonred Already Exists in BG. So sending its PID: 10056
-SDL/APP: [LOVE] Error: [love "boot.lua"]:48: Failed to initialize filesystem: already initialized
-```
-
-The app appears to launch and instantly die, and only starts again after being
-swiped out of Recents. Autoboot makes launch → play → exit → relaunch the
-everyday loop, so this is hit constantly without the hard exit.
-
-`"restart"` quits (mod toggle, importer hand-off) deliberately re-enter boot
-inside the running process and are excluded — liblove tears the Lua state, and
-so the filesystem module, down for those.
+`love.system.httpDownload(url, absPath [, userAgent [, accept]])` ->
+`GameActivity.httpDownload` (same JNI route as the picker and the step
+bridge: `common/android.cpp` -> `modules/system/System.cpp` ->
+`wrap_System.cpp`). Android ships no `curl`, which is what the desktop
+builds fetch the mod index, mod release lists and mod zips with, so the
+"Find mods" tab used to fail with "curl is not available on this
+platform" (#597). The Java side is a blocking `HttpsURLConnection` GET
+(https only, redirects followed by hand, body renamed into place only
+once complete) and runs on LOVE's Lua thread, never the UI thread.
+`src/core/HostShell.lua` picks the transport: curl when present,
+otherwise this bridge; an APK older than the bridge simply reports no
+transport, exactly as a missing curl does.
 
 ### SDK / NDK
 
 love-android 11.5a expects:
 
 - **JDK 17**
-- Android SDK with **API 34**
+- Android SDK with **API 36** (Android 16; latest 36.x Build-Tools)
 - NDK **25.2.9519653** (Apple Silicon host supported)
+- **minSdk 19** (Android 4.4), **targetSdk 36** (Android 16)
 
 Set `ANDROID_SDK_ROOT` (or `ANDROID_HOME`), or let the script write
 `local.properties` when it finds `~/Library/Android/sdk`.
+
+**ShaderFX bridge**: `scripts/build_android.sh` bundles
+`liblibrashader_bridge.so` for arm64-v8a and armeabi-v7a via `cargo ndk` (or
+from `SHADERFX_BRIDGE_ANDROID_DIR`), and warns and continues when neither is
+available; see `docs/shaderfx.md`.
 
 Gradle flavor used: **`embedNoRecord`** (game fused into the APK, no microphone).
 Build task: `assembleEmbedNoRecordDebug`.
@@ -119,7 +114,11 @@ The APK lands under `app/build/outputs/apk/embedNoRecord/debug/`.
 ### Payload path
 
 `app/src/embed/assets/game.love` - zip of `main.lua`, `conf.lua`, `src/`,
-`data/`, `assets/`, and `tools/rom_manifest.json`. Generated game data,
+`libs/` (the vendored FlexLove toolkit the launcher UI needs), `data/`,
+`assets/`, and the Red, Blue, Yellow, Gold, and Silver ROM manifests. The
+Android packer verifies the Yellow, Gold, and Silver manifests before it
+packages; if a partial source export omitted one, it restores the file from
+this checkout's Git data and then falls back to the project's GitHub copy. Generated game data,
 scripts, tests, and mobile build sources are excluded.
 
 ## Branding (applied by the build script)
@@ -128,16 +127,25 @@ scripts, tests, and mobile build sources are excluded.
 | --- | --- |
 | `app.application_id` | `com.theboisclub.pokemonred` |
 | `app.name` | Pokemon Red |
-| `app.orientation` | `portrait` |
-| `app.version_name` / `app.version_code` | set from `--version X.Y.Z` (code = major*10000 + minor*100 + patch); left as-is if `--version` is omitted |
-| Permissions | INTERNET / RECORD_AUDIO / WRITE_EXTERNAL_STORAGE stripped; VIBRATE + BLUETOOTH kept |
+| `app.orientation` | `fullUser`. This is only the manifest default: SDL requests FULL_SENSOR at window creation (resizable window, no `SDL_HINT_ORIENTATIONS`), and `GameActivity.setOrientationBis` remaps that to FULL_USER so the device's rotation lock is honoured. |
+| `app.version_name` / `app.version_code` | set from `--version X.Y.Z` (code = major*1,000,000 + minor*1,000 + patch); left as-is if `--version` is omitted |
+| Permissions | RECORD_AUDIO / WRITE_EXTERNAL_STORAGE stripped; VIBRATE + BLUETOOTH + INTERNET (link play, mod index) + ACTIVITY_RECOGNITION (step bridge) kept; REQUEST_INSTALL_PACKAGES is limited to the user-confirmed full-update installer |
 
 ## Releases
 
 `.github/workflows/release.yml` builds the APK with `--version` set to the
 release version and publishes it alongside the macOS/Windows/Linux builds as
-`PokemonRed-<version>-android.apk`.
+`gen1recomp-<version>-android.apk`.
 
 ## Signing
 
-Signed with the default Android keystore (no setup required).
+Production APKs are built with `scripts/build_android.sh --release`. They must
+be signed with the same long-lived certificate as the currently installed app:
+Android's Package Installer rejects an update with a different signing
+certificate. Store that keystore and its passwords only in CI secrets, expose
+them as `GEN1RECOMP_ANDROID_KEYSTORE`,
+`GEN1RECOMP_ANDROID_KEYSTORE_PASSWORD`, `GEN1RECOMP_ANDROID_KEY_ALIAS`, and
+`GEN1RECOMP_ANDROID_KEY_PASSWORD`, and never commit the keystore. A newly
+created certificate cannot update users who have an APK signed by a different
+legacy key; those users need one final manual reinstall before in-app updates
+can take over.

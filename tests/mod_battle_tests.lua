@@ -11,6 +11,7 @@ local Font = require("src.render.Font")
 Font.load(Data)
 
 local BattleState = require("src.battle.BattleState")
+local PaletteFX = require("src.render.PaletteFX")
 local Catching = require("src.battle.Catching")
 local Damage = require("src.battle.Damage")
 local Events = require("src.mods.Events")
@@ -22,6 +23,7 @@ local MoveEffects = require("src.battle.MoveEffects")
 local Pokemon = require("src.pokemon.Pokemon")
 local Runtime = require("src.mods.Runtime")
 local SaveData = require("src.core.SaveData")
+local Schemas = require("src.mods.Schemas")
 local Status = require("src.battle.Status")
 local TrainerAI = require("src.battle.TrainerAI")
 local TurnOrder = require("src.battle.TurnOrder")
@@ -51,7 +53,8 @@ local function makeGame(party)
   function stack:pop() return table.remove(self.states) end
   function stack:top() return self.states[#self.states] end
   return { data = Data, save = save, stack = stack,
-           input = { wasPressed = function() return true end } }
+           input = { wasPressed = function() return true end,
+                     isDown = function() return true end } }
 end
 
 local function pump(battle, limit)
@@ -290,7 +293,8 @@ do
                  end },
                  stack = { pop = function() end } }
   local menu = OptionsMenu.new(game)
-  menu.index = 4
+  -- RULESET is in no group, so this focuses it on the top level.
+  check(menu:focusRow("ruleset") == menu, "RULESET focuses in place")
   local function press(key)
     pressed = { [key] = true }
     menu:update(1 / 60)
@@ -324,6 +328,54 @@ do
 end
 
 -- ------- ai_classes: brains and layer records
+
+-- ------- custom trainer portraits: palette sources and base portraits
+
+do
+  local oldMode = PaletteFX.mode
+  PaletteFX.mode = "redpp"
+  local custom = { id = "TEST_TRAINER",
+                   paletteSource = "ROM:SpriteSheetPointerTable[21]" }
+  local pal = BattleState.trainerPalette(Data, custom)
+  local expected = PaletteFX.spriteObp({ paletteSource = custom.paletteSource }, custom.id)
+  PaletteFX.mode = oldMode
+  check(pal and expected and pal.colors[3][1] == expected[3][1]
+        and pal.colors[3][2] == expected[3][2]
+        and pal.colors[3][3] == expected[3][3],
+        "a custom trainer portrait resolves its Advanced OBJ palette source")
+  check(BattleState.trainerPicPath(Data, { basePic = "OPP_ENGINEER" })
+        == Data.trainers.OPP_ENGINEER.pic,
+        "a custom trainer can reuse a base trainer portrait by id")
+  check(BattleState.trainerTrueColor(Data, { trueColor = true }) == true,
+        "a trainer record's trueColor flag is readable")
+  check(BattleState.trainerTrueColor(Data, { trueColor = false }) == false,
+        "explicit false stays false")
+  check(BattleState.trainerTrueColor(Data, { basePic = "OPP_ENGINEER" })
+        == false,
+        "a vanilla base portrait is not trueColor")
+  check(Schemas.check(Schemas.REGISTRIES.trainers, "trainers", "OPP_BROCK",
+                      { trueColor = true }, "patch"),
+        "a trueColor trainers patch validates against the catalog schema")
+  check(Schemas.check(Schemas.REGISTRIES.trainers, "trainers", "BEAUTY",
+                      { pic = "mods/x/beauty.png", trueColor = true },
+                      "patch", 2),
+        "a Gold trainers patch can carry pic and trueColor")
+  check(Schemas.check(Schemas.REGISTRIES.trainers, "trainers", "OPP_RIVAL1",
+                      { parties = { { { level = 70, species = "MEWTWO",
+                                        moves = { "PSYCHIC_M" } } } } },
+                      "patch"),
+        "a party slot's moves list validates against the catalog schema")
+  check(not Schemas.check(Schemas.REGISTRIES.trainers, "trainers", "OPP_RIVAL1",
+                          { parties = { { { level = 70, species = "MEWTWO",
+                                            moves = "PSYCHIC_M" } } } },
+                          "patch"),
+        "a party slot's moves must still be a list of move ids")
+  check(Schemas.check(Schemas.REGISTRIES.trainers, "trainers", "BEAUTY",
+                      { trainers = { { name = "GRACE", party = {
+                          { level = 20, species = "PIKACHU",
+                            moves = { "THUNDERSHOCK" } } } } } }, "patch", 2),
+        "the Gold party slot keeps its own moves list")
+end
 
 do
   Data.ai_classes = { OPP_YOUNGSTER = { brain = function(battle)
@@ -581,7 +633,7 @@ do
     local game = uiGame({ mon })
     Bag.add(game.save, "RARE_CANDY", 1)
     game.stack:push(BagMenu.new(game))
-    for _ = 1, 600 do
+    for _ = 1, 800 do
       local top = game.stack:top()
       if not top then break end
       pressed = { a = true }
@@ -694,6 +746,100 @@ do
   check(actBattle:enemyAction().hooked == true,
         "battle.enemy_action hook rewrites the choice")
   unsub()
+
+  -- engine/battle/core.asm:416,454
+  unsub = hooks:wrap("battle.enemy_action", function()
+    return { id = "TACKLE", pp = 1, hooked = true }
+  end)
+  local forcedGame = makeGame({ Pokemon.new(Data, "BULBASAUR", 20) })
+  local forcedBattle = BattleState.newTrainer(forcedGame, "OPP_BROCK", 1)
+  forcedBattle.rng = mkseq({})
+  forcedBattle.performMove = function() end
+  forcedBattle.enemy.mon.status = "PSN"
+  local forcedUses = forcedBattle.aiUses
+  check((forcedUses or 0) > 0, "the trainer battle seeds wAICount")
+  local forcedAction = forcedBattle:enemyAction()
+  check(forcedAction.hooked == true,
+        "battle.enemy_action hook rewrites a trainer's choice too")
+  forcedBattle:executeAction(forcedBattle.enemy, forcedBattle.player, forcedAction)
+  check(forcedBattle.enemy.mon.status == "PSN"
+        and forcedBattle.aiUses == forcedUses
+        and not hasText(forcedBattle, "FULL HEAL"),
+        "a hook-forced trainer action suppresses the class item roll")
+  unsub()
+
+  local rollGame = makeGame({ Pokemon.new(Data, "BULBASAUR", 20) })
+  local rollBattle = BattleState.newTrainer(rollGame, "OPP_BROCK", 1)
+  rollBattle.rng = mkseq({})
+  rollBattle.performMove = function() end
+  rollBattle.enemy.mon.status = "PSN"
+  local rollUses = rollBattle.aiUses
+  rollBattle:executeAction(rollBattle.enemy, rollBattle.player,
+                           rollBattle:enemyAction())
+  check(rollBattle.enemy.mon.status == nil and rollBattle.aiUses == rollUses - 1,
+        "with no hook the class item roll still fires at the enemy's slot")
+
+  -- battle.catch_exp: vanilla catches never grant exp; a mod can flip that
+  unsub = hooks:wrap("battle.catch_exp", function() return true end)
+  local catchExpParty = { Pokemon.new(Data, "BULBASAUR", 10) }
+  local catchExpGame = makeGame(catchExpParty)
+  local catchExpBattle = BattleState.newWild(catchExpGame, "RATTATA", 3)
+  catchExpBattle.enemy.mon = Pokemon.new(Data, "RATTATA", 3)
+  local expBeforeCatch = catchExpParty[1].exp
+  catchExpBattle:storeCaughtMon()
+  check(catchExpParty[1].exp > expBeforeCatch,
+        "battle.catch_exp hook pays out exp on a catch")
+  unsub()
+
+  -- battle.exp_award: a mod can replace the participant/EXP.ALL split
+  -- wholesale via ctx.applyShare
+  unsub = hooks:wrap("battle.exp_award", function(nextFn, ctx)
+    ctx.applyShare(ctx.alive[1], 999, "flatShare")
+  end)
+  local awardParty = { Pokemon.new(Data, "BULBASAUR", 10) }
+  local awardGame = makeGame(awardParty)
+  local awardBattle = BattleState.newWild(awardGame, "RATTATA", 3)
+  local expBeforeAward = awardParty[1].exp
+  awardBattle:awardExp()
+  check(awardParty[1].exp > expBeforeAward,
+        "battle.exp_award hook replaces the award split")
+  unsub()
+end
+
+-- ------- battle.low_health_alarm hook: mirrors the siren toggle
+
+do
+  local Sound = require("src.core.Sound")
+  local calls = {}
+  local origStart, origStop = Sound.startLoop, Sound.stopLoop
+  Sound.startLoop = function(data, name) calls[#calls + 1] = { "start", name } end
+  Sound.stopLoop = function(name) calls[#calls + 1] = { "stop", name } end
+
+  local game = makeGame({ Pokemon.new(Data, "BULBASAUR", 20) })
+  local battle = BattleState.newWild(game, "RATTATA", 5)
+  battle.player.mon.hp = 1
+  battle.player.shownHP = 1
+
+  local seenOn = nil
+  local unsub = hooks:wrap("battle.low_health_alarm", function(nextFn, ctx)
+    seenOn = ctx.on
+    return nextFn(ctx)
+  end)
+  battle:updateFx()
+  check(seenOn == true, "battle.low_health_alarm hook sees the alarm toggle on")
+  check(calls[#calls][1] == "start" and calls[#calls][2] == "Low_Health_Alarm",
+        "an unmodified hook still starts the siren loop")
+  unsub()
+
+  unsub = hooks:wrap("battle.low_health_alarm", function(nextFn, ctx)
+    ctx.on = false
+    return nextFn(ctx)
+  end)
+  battle:updateFx()
+  check(calls[#calls][1] == "stop", "a mod can force the alarm off before vanilla acts")
+  unsub()
+
+  Sound.startLoop, Sound.stopLoop = origStart, origStop
 end
 
 -- ------- battle events: the scripted sequence

@@ -66,6 +66,7 @@ local function gameWith(opts)
         _VermilionCitySailor1YouNeedATicketText =
           "You need a ticket\nto get aboard.",
         _VermilionCitySailor1ShipSetSailText = "The ship set sail.",
+        _VermilionCitySailor1WelcomeToSSAnneText = "Welcome to S.S.\nANNE!",
         _SSAnneCaptainsRoomRubCaptainsBackText = "Rub-rub...",
         _SSAnneCaptainsRoomCaptainIFeelMuchBetterText = "I feel better!",
         _SSAnneCaptainsRoomCaptainReceivedHM01Text = "Got HM01!",
@@ -81,7 +82,7 @@ end
 
 local function owWith(moved)
   return {
-    player = { facing = "down", cellY = 2 },
+    player = { facing = "down", cellX = 14, cellY = 2 },
     scriptMove = function(_, _, dir, n) moved[#moved + 1] = { dir, n } end,
     queueScript = function(self, rows) self._queued = rows end,
     startDustAnim = function() end,
@@ -143,25 +144,36 @@ do
   check(#pushed == 0, "no spurious dialog off the check")
 end
 
--- Sailor talk after ship left: ShipSetSail branch (row script).
+-- Sailor talk: once she has sailed he only reports it gone, and before
+-- that an A press is the plain greeting, never the ticket check (#1651).
+-- scripts/VermilionCity.asm:158-198
 do
-  local ScriptRunner = require("src.script.ScriptRunner")
-  local game = gameWith({ flags = { EVENT_SS_ANNE_LEFT = true } })
-  local rows = city.talk.TEXT_VERMILIONCITY_SAILOR1
-  local runner = ScriptRunner.new(game, nil)
-  runner:run(rows, {})
-  local guard = 0
-  while runner:isRunning() and guard < 200 do
-    guard = guard + 1
-    if game.stack and game._pushed then
-      local box = game._pushed[#game._pushed]
-      if box and box.done then box.done() end
-    end
-    runner:update()
-  end
-  local last = game._pushed[#game._pushed]
-  eq(last and last.text, "The ship set sail.",
+  local talk = city.talk.TEXT_VERMILIONCITY_SAILOR1
+  local game, pushed = gameWith({ flags = { EVENT_SS_ANNE_LEFT = true } })
+  talk(game, owWith({}), nil, function() end)
+  eq(pushed[#pushed] and pushed[#pushed].text, "The ship set sail.",
      "talk after ship left shows ShipSetSail")
+
+  game, pushed = gameWith({})
+  local ow = owWith({})
+  ow.player.cellX, ow.player.cellY, ow.player.facing = 18, 30, "right"
+  talk(game, ow, nil, function() end)
+  eq(pushed[#pushed] and pushed[#pushed].text, "Welcome to S.S.\nANNE!",
+     "facing him from the west is the plain greeting, no ticket check")
+
+  game, pushed = gameWith({})
+  ow = owWith({})
+  ow.player.cellX, ow.player.cellY, ow.player.facing = 19, 29, "down"
+  talk(game, ow, nil, function() end)
+  eq(pushed[#pushed] and pushed[#pushed].text, "Welcome to S.S.\nANNE!",
+     "talking from in front of him is the plain greeting too")
+
+  game, pushed = gameWith({})
+  ow = owWith({})
+  ow.player.cellX, ow.player.cellY, ow.player.facing = 19, 31, "up"
+  talk(game, ow, nil, function() end)
+  eq(pushed[#pushed] and pushed[#pushed].text, "Welcome to S.S.\nANNE!",
+     "and from behind him")
 end
 
 -- Departure cutscene: Music_Surfing + EVENT_SS_ANNE_LEFT via Flags.set.
@@ -178,18 +190,24 @@ do
   end
   check(sawSurf, "departure plays Music_Surfing")
   check(ow._queued ~= nil, "departure queues the sail-away script")
-  local kept, horn = false, false
+  -- #360: the surf override must NOT ride into Vermilion City, and she
+  -- sails west block by block
+  local kept, horns, sails, shuffled, faced = false, 0, 0, 0, false
   for _, row in ipairs(ow._queued or {}) do
-    if row[1] == "play_music" and row[2] == "Music_Surfing"
-        and row[3] and row[3].keep then
-      kept = true
-    end
+    if row[1] == "play_music" and row[3] and row[3].keep then kept = true end
     if row[1] == "play_sound" and row[2] == "SS_Anne_Horn" then
-      horn = true
+      horns = horns + 1
     end
+    if row[1] == "ss_anne_departs" then sails = sails + 1 end
+    if row[1] == "replace_block" then shuffled = shuffled + 1 end
+    if row[1] == "face_player_dir" and row[2] == "down" then faced = true end
   end
-  check(kept, "departure keeps Music_Surfing across the city warp")
-  check(horn, "departure queues SS_Anne_Horn")
+  eq(kept, false, "departure lets VERMILION_CITY's own theme take the warp")
+  eq(horns, 2, "the horn blows before and after she sails")
+  eq(sails, 1, "she slides west as one animation, not a block shuffle")
+  eq(shuffled, 0, "and no hull block is stamped across the dock any more")
+  -- scripts/VermilionDock.asm:50 (#1689)
+  eq(faced, true, "he keeps facing down until he walks out")
 end
 
 -- Captain rub jingle: play_once Music_PkmnHealed sits after the rub text.

@@ -1,6 +1,10 @@
 -- More hand-ported events: the Pallet Town intro, the thirsty Saffron
 -- gate guards, the Bike Voucher chain, fossils and the day-care.
--- Registered via data/scripts/init.lua; each cites its pokered source.
+-- Registered via data/scripts/init.lua; Red/Blue cite pokered, Yellow
+-- cites pokeyellow (Pallet stop row, Oak spawn, walk RLE, and the
+-- wild-Pikachu beat before the lab escort).
+
+local GameVersion = require("src.core.GameVersion")
 
 local M = {}
 
@@ -35,72 +39,91 @@ function escort.findPath(fromX, fromY, toX, toY)
   return path
 end
 
--- PalletTownOakWalksToPlayerScript: Oak appears at his object spot
--- (8,5) and zigzags to one tile below the player (hNPCPlayerYDistance
--- is pre-decremented before predef FindPathToPlayer).
+-- Red: Oak object (8,5) -> one tile below the player at y=1.
+-- Yellow: Oak object (10,4); stop fires at y=0 (pokeyellow PalletTown).
 function escort.oakApproach(playerX)
+  if GameVersion.isYellow() then
+    return escort.findPath(10, 4, playerX, 1)
+  end
   return escort.findPath(8, 5, playerX, 2)
 end
 
--- RLEList_ProfOakWalkToLab (engine/overworld/auto_movement.asm):
--- DOWN x5, LEFT, DOWN x5, RIGHT x3, UP -- Oak's last step lands on the
--- lab door (12,11).  (The trailing NPC_CHANGE_FACING is a march-in-
--- place beat on the mat; here Oak just stands his final beat.)
-escort.oakSteps = {
-  "down", "down", "down", "down", "down",
-  "left",
-  "down", "down", "down", "down", "down",
-  "right", "right", "right",
-  "up",
-}
+-- RLEList_ProfOakWalkToLab (engine/overworld/auto_movement.asm).
+-- Yellow differs: first DOWN is x6 (Oak starts one tile farther north).
+local function buildOakSteps()
+  if GameVersion.isYellow() then
+    return {
+      "down", "down", "down", "down", "down", "down",
+      "left",
+      "down", "down", "down", "down", "down",
+      "right", "right", "right",
+      "up",
+    }
+  end
+  return {
+    "down", "down", "down", "down", "down",
+    "left",
+    "down", "down", "down", "down", "down",
+    "right", "right", "right",
+    "up",
+  }
+end
 
--- RLEList_PlayerWalkToLab decodes to UP x2, RIGHT x3, DOWN x5, LEFT,
--- DOWN x6 and plays in REVERSE buffer order (wSimulatedJoypadStatesEnd
--- grows downward): DOWN x6, LEFT, DOWN x5, RIGHT x3, UP x2 -- Oak's
--- exact path one step behind.  The 17th press (the second UP) is eaten
--- by the door-warp frame (WarpFound clears hJoyHeld via EnterMap), so
--- only 16 real steps happen; the walk ends on the door at (12,11).
+escort.oakSteps = buildOakSteps()
+
+-- Player stays one step behind Oak (simplified reverse-RLE port).
 escort.playerSteps = { "down" }
 for _, d in ipairs(escort.oakSteps) do
   escort.playerSteps[#escort.playerSteps + 1] = d
 end
 
+local function npcNamed(ow, name)
+  for _, n in ipairs(ow.npcs or {}) do
+    if n.def and n.def.name == name then return n end
+  end
+  return nil
+end
+
 M.PALLET_TOWN = {
   talk = require("data.scripts.pallet_town").talk,
   escort = escort,
-  -- Oak stops you at the north row (PalletTownDefaultScript's
-  -- `wYCoord == 1` check), walks up from (8,5), and leads you to his
-  -- lab with the player one step behind (scripts/PalletTown.asm +
-  -- PalletMovementScriptPointerTable in
-  -- engine/overworld/auto_movement.asm), then the lab walk-in and the
-  -- choose-mon exchange (scripts/OaksLab.asm OaksLabDefaultScript ..
-  -- OaksLabOakChooseMonSpeechScript).
+  -- scripts/PalletTown.asm:133-144
+  onEnter = function(game, ow)
+    local f = game.save.flags
+    if f.EVENT_GOT_TOWN_MAP and f.EVENT_ENTERED_BLUES_HOUSE
+       and not f.EVENT_DAISY_WALKING then
+      f.EVENT_DAISY_WALKING = true
+      local Commands = require("src.script.Commands")
+      local ctx = { save = game.save, game = game, overworld = ow }
+      Commands.hide_object(ctx, "BLUES_HOUSE", "BLUESHOUSE_DAISY1")
+      Commands.show_object(ctx, "BLUES_HOUSE", "BLUESHOUSE_DAISY2")
+    end
+  end,
+  -- Red: stop at y==1 from (8,5).  Yellow: stop at y==0 from (10,4),
+  -- then a wild Pikachu battle before the lab escort (pokeyellow
+  -- PalletTownPikachuBattleScript).
   onStep = function(game, ow, x, y)
-    if y ~= 1 or game.save.flags.EVENT_FOLLOWED_OAK_INTO_LAB
+    local yellow = GameVersion.isYellow()
+    local stopY = yellow and 0 or 1
+    if y ~= stopY or game.save.flags.EVENT_FOLLOWED_OAK_INTO_LAB
        or game.save.flags.EVENT_GOT_STARTER then
       return false
     end
     local TextBox = require("src.render.TextBox")
     local Commands = require("src.script.Commands")
     local Music = require("src.core.Music")
+    local BattleState = require("src.battle.BattleState")
     local t = game.data.text
     local ctx = { save = game.save, game = game, overworld = ow }
 
-    -- PalletTownDefaultScript: stop the player, turn them around
-    -- (wPlayerMovingDirection = PLAYER_DIR_DOWN applies on the very
-    -- next frame, before the text box opens) and strike up the "oak
-    -- appears" theme (MUSIC_MEET_PROF_OAK)
-    ow.player.facing = "down"
+    -- Red turns the player down; Yellow faces up at the north exit.
+    ow.player.facing = yellow and "up" or "down"
     Music.play(game.data, "Music_MeetProfOak")
 
-    -- DelayFrames-style hold: the world pauses (input stays locked)
-    -- for `frames` frames, then cb runs.  Reuses the emote pause slot;
-    -- with an `npc` the "!" bubble draws above it (EmotionBubble).
     local function hold(frames, npc, cb)
       ow.emote = { frames = frames, npc = npc, onDone = cb }
     end
 
-    -- chain single-tile scriptMoves through a direction list
     local function walkList(entity, steps, done)
       local i = 0
       local function nextStep()
@@ -114,10 +137,8 @@ M.PALLET_TOWN = {
       nextStep()
     end
 
-    -- ---- Oak's Lab side (scripts/OaksLab.asm) ----------------------
-
-    -- OaksLabOakChooseMonSpeechScript: the fed-up / choose-mon /
-    -- what-about-me / be-patient exchange, Delay3 between boxes
+    -- OaksLabOakChooseMonSpeechScript.  Yellow's OakChooseMon text is
+    -- the single-ball speech, not Red's "there are 3 POKéMON".
     local function chooseMonSpeech()
       local function say(key, fb, next)
         game.stack:push(TextBox.new(game, t[key] or fb, next))
@@ -126,7 +147,9 @@ M.PALLET_TOWN = {
           "{RIVAL}: Gramps!\nI'm fed up with\nwaiting!", function()
         hold(3, nil, function()
           say("_OaksLabOakChooseMonText",
-              "OAK: Here, {PLAYER}!\fThere are 3\nPOKéMON here!\fYou can have one!\nChoose!", function()
+              yellow
+                and "OAK: Look, {PLAYER}! Do\nyou see that ball\non the table?"
+                or "OAK: Here, {PLAYER}!\fThere are 3\nPOKéMON here!\fYou can have one!\nChoose!", function()
             hold(3, nil, function()
               say("_OaksLabRivalWhatAboutMeText",
                   "{RIVAL}: Hey!\nGramps! What\nabout me?", function()
@@ -143,30 +166,18 @@ M.PALLET_TOWN = {
       end)
     end
 
-    -- entering the lab: the door Oak (OAKSLAB_OAK2, (5,10)) walks up 3
-    -- ahead of the player (OaksLabOakEntersLabScript OakEntryMovement),
-    -- swaps for the desk Oak (OAKSLAB_OAK1, (5,2)), then the player
-    -- walks up 8 from the mat (PlayerEntryMovementRLE) while the rival
-    -- and Oak turn with them (OaksLabPlayerEntersLabScript /
-    -- OaksLabFollowedOakScript)
+    -- Door Oak is OAKSLAB_OAK2: Red index 8, Yellow index 6 (one ball).
     local function labWalkIn()
-      local oak2 = ow:npcByIndex(8)
+      local oak2 = npcNamed(ow, "OAKSLAB_OAK2") or ow:npcByIndex(yellow and 6 or 8)
       local function swapOaks()
         Commands.hide_object(ctx, "OAKS_LAB", "OAKSLAB_OAK2")
         Commands.show_object(ctx, "OAKS_LAB", "OAKSLAB_OAK1")
-        hold(3, nil, function() -- Delay3
-          Commands.face_object(ctx, 1, "down") -- rival watches you pass
+        hold(3, nil, function()
+          Commands.face_object(ctx, 1, "down")
           ow:scriptMove(ow.player, "up", 8, function()
-            -- OaksLabFollowedOakScript: flags only after the walk-in, so a
-            -- stray step on the door mat can't fire the "don't go away"
-            -- push-up (oaks_lab.lua onStep) mid-cutscene.  Outdoor escort
-            -- still re-arms on F1 mid-escort -- these flags stay clear
-            -- until the lab walk finishes.
             game.save.flags.EVENT_FOLLOWED_OAK_INTO_LAB = true
             game.save.flags.EVENT_FOLLOWED_OAK_INTO_LAB_2 = true
             Commands.face_object(ctx, 1, "up")
-            -- res BIT_NO_MAP_MUSIC + PlayDefaultMusic: the lab theme
-            -- only starts once the walk-in is done
             Music.playMap(game.data, "OAKS_LAB")
             chooseMonSpeech()
           end)
@@ -179,10 +190,8 @@ M.PALLET_TOWN = {
       end
     end
 
-    -- PalletMovementScript_Done + the door warp: Oak is hidden as the
-    -- player steps into the doorway; PALLET_TOWN warp 3 -> OAKS_LAB
-    -- warp 2 = (5,11), with the door SFX (WarpFound -> SFX_GO_INSIDE)
-    local function enterLab()
+    local function enterLab(oak)
+      if oak then oak.stepFrames = nil end
       Commands.hide_object(ctx, "PALLET_TOWN", "PALLETTOWN_OAK")
       Commands.show_object(ctx, "OAKS_LAB", "OAKSLAB_OAK2")
       ow.doorWarp = true
@@ -190,25 +199,23 @@ M.PALLET_TOWN = {
                      { keepMusic = true })
     end
 
-    -- PalletMovementScript_WalkToLab: Oak's NPC movement and the
-    -- player's simulated joypad run simultaneously, in lockstep; the
-    -- player retraces Oak's path one step behind and follows him into
-    -- the doorway on the final beat
     local function walkToLab(oak)
+      -- lockstep half runs Oak on the player's own frames per cell
+      -- engine/overworld/movement.asm:737 (DoScriptedNPCMovement)
       local i = 0
+      if oak then
+        oak.stepFrames = ow.player.stepFramesCur or ow.player.stepFrames
+      end
       local function tick()
         i = i + 1
         local playerStep = escort.playerSteps[i]
         if not playerStep then
-          enterLab()
+          enterLab(oak)
           return
         end
         if oak and escort.oakSteps[i] then
           ow:scriptMove(oak, escort.oakSteps[i], 1)
         elseif oak then
-          -- RLEList_ProfOakWalkToLab's trailing NPC_CHANGE_FACING beat:
-          -- Oak marches in place on the door mat while the player takes
-          -- the final step up behind him (movement.asm ChangeFacingDirection)
           ow:marchInPlace(oak)
         end
         ow:scriptMove(ow.player, playerStep, 1, tick)
@@ -216,10 +223,14 @@ M.PALLET_TOWN = {
       tick()
     end
 
-    -- PalletMovementScript_OakMoveLeft/_PlayerMoveLeft: from the right
-    -- tile (x == 11) Oak sidesteps left first, then the player follows
-    -- left (wNumStepsToTake = wXCoord - 10), and only then both walk
     local function escortToLab(oak)
+      -- PalletMovementScript_OakMoveLeft
+      -- (engine/overworld/auto_movement.asm) starts MUSIC_MUSEUM_GUY
+      -- when the escort begins in Yellow. Until then, Pallet Town plays
+      -- after the battle; Red/Blue leave MUSIC_MEET_PROF_OAK playing.
+      if yellow then
+        Music.play(game.data, "Music_MuseumGuy")
+      end
       local numSteps = x - 10
       if oak and numSteps > 0 then
         ow:scriptMove(oak, "left", numSteps, function()
@@ -232,37 +243,76 @@ M.PALLET_TOWN = {
       end
     end
 
-    -- ---- Pallet Town side (scripts/PalletTown.asm) -----------------
+    -- After Oak reaches the player: Red goes straight to "It's unsafe!".
+    -- Yellow (PalletTownOakGreetsPlayerScript..AfterPikachuBattleScript):
+    -- ThatWasClose -> Oak faces the grass patch -> BATTLE_TYPE_PIKACHU
+    -- (the old-man-style simulated battle where PROF.OAK throws the ball
+    -- and always catches the lv5 Pikachu) -> Whew -> ComeWithMe.
+    local function afterOakArrives(oak)
+      if not yellow then
+        game.stack:push(TextBox.new(game,
+          t._PalletTownOakItsUnsafeText
+          or "OAK: It's unsafe!\nWild POKéMON\nlive in tall grass!",
+          function() escortToLab(oak) end))
+        return
+      end
+      local function comeWithMe()
+        game.stack:push(TextBox.new(game,
+          t._PalletTownOakComeWithMe
+          or "OAK: Here, come with\nme!",
+          function() escortToLab(oak) end))
+      end
+      local function afterPikaBattle()
+        if oak then oak.facing = "up" end
+        game.stack:push(TextBox.new(game,
+          t._PalletTownOakWhewText or "OAK: Whew...",
+          comeWithMe))
+      end
+      game.stack:push(TextBox.new(game,
+        t._PalletTownOakThatWasCloseText
+        or "OAK: That was\nclose!\fWild POKéMON live\nin tall grass!",
+        function()
+          -- Oak turns toward the horizontally adjacent grass (left exit
+          -- looks right, right exit looks left -- the
+          -- EVENT_PLAYER_AT_RIGHT_EXIT_TO_PALLET_TOWN branch).
+          -- In pokeyellow, PalletTownOakGreetsPlayerScript turns Oak and
+          -- PalletTownPikachuBattleScript arms the battle on the next
+          -- overworld iteration. OverworldLoopLessDelay
+          -- (home/overworld.asm) burns two DelayFrame calls at the top
+          -- of each iteration and calls RunMapScript before checking
+          -- wCurOpponent, so those two DelayFrame calls are what keep
+          -- Oak's turn on screen before the battle check fires.
+          if oak then oak.facing = x == 10 and "right" or "left" end
+          hold(2, nil, function()
+            local battle = BattleState.newWild(game, "PIKACHU", 5)
+            battle:makeOldManDemo("PROF.OAK")
+            battle.onFinish = function()
+              afterPikaBattle()
+            end
+            -- Use the standard wild-battle entry transition.
+            -- scripts/PalletTown.asm:117
+            Commands.pushBattle(ctx, battle, oak)
+          end)
+        end))
+    end
 
-    -- PalletTownOakWalksToPlayerScript: Oak appears at (8,5), faces up
-    -- (SetSpriteFacingDirectionAndDelay + Delay3), then zigzags to the
-    -- player; the "It's unsafe!" text follows and the escort begins
     local function oakAppearsAndWalks()
       Commands.show_object(ctx, "PALLET_TOWN", "PALLETTOWN_OAK")
-      local oak = ow:npcByIndex(1)
+      local oak = npcNamed(ow, "PALLETTOWN_OAK") or ow:npcByIndex(1)
       if oak then oak.facing = "up" end
       hold(6, nil, function()
         walkList(oak, escort.oakApproach(x), function()
-          -- PalletTownOakNotSafeComeWithMeScript: the second text waits
-          -- for a button, then the escort starts
-          game.stack:push(TextBox.new(game,
-            t._PalletTownOakItsUnsafeText
-            or "OAK: It's unsafe!\nWild POKéMON\nlive in tall grass!",
-            function() escortToLab(oak) end))
+          afterOakArrives(oak)
         end)
       end)
     end
 
-    -- The "Hey! Wait!" box ends without a button wait (auto), then the
-    -- "!" bubble shows over the player WHILE the box is still on screen
-    -- (PalletTownOakText: DelayFrames 10 then EmotionBubble, box not yet
-    -- cleared).  onOverlap sets the bubble during the box's last frames;
-    -- the box pops after `overlap`, and the bubble's 60-frame hold then
-    -- runs to Oak's appearance (the bubble is static while the box is up,
-    -- since the overworld pauses under it, so 10 overlap + 50 = 60).
     game.stack:push(TextBox.new(game,
       t._PalletTownOakHeyWaitDontGoOutText or "OAK: Hey! Wait!\nDon't go out!",
       nil, { auto = { delay = 10, overlap = 10, onOverlap = function()
+        -- .HeyWaitDontGoOutText turns the player to face down (toward
+        -- the approaching Oak) before the exclamation bubble
+        ow.player.facing = "down"
         ow.emote = { npc = ow.player, frames = 50, onDone = oakAppearsAndWalks }
       end } }))
     return true
@@ -365,7 +415,7 @@ local function saffronGate(guardText, triggers, horizontal)
       game.stack:push(TextBox.new(game,
         t._SaffronGateGuardGeeImThirstyText or "Gee, I'm thirsty\nthough!\nThe road's closed.",
         function()
-          ow:scriptMove(ow.player, back, 1)
+          ow:scriptMove(ow.player, back, 1, nil, { collide = true })
         end))
       return true
     end,
@@ -382,39 +432,170 @@ M.ROUTE_8_GATE = saffronGate("TEXT_ROUTE8GATE_GUARD", { { 2, 3 }, { 2, 4 } }, tr
 -- -------------------------------------------------------------------
 
 M.POKEMON_FAN_CLUB = {
+  onEnter = function(game, ow)
+    require("src.world.PikachuFollower").onFanClubEntered(game, ow)
+  end,
   talk = {
     TEXT_POKEMONFANCLUB_CHAIRMAN = {
       { "face_player" },                                          -- 1
       { "check_flag", "EVENT_RECEIVED_BIKE_VOUCHER" },            -- 2
-      { "jump_if_true", 9 },                                      -- 3
-      { "show_text", "_PokemonFanClubChairmanIntroText" },        -- 4
-      { "show_text", "_PokemonFanClubChairmanStoryText" },        -- 5
+      { "jump_if_true", "nothing_left" },                         -- 3
+      -- YesNoChoice (scripts/PokemonFanClub.asm): NO forfeits the voucher (#1050)
+      { "ask", "_PokemonFanClubChairmanIntroText" },              -- 4
+      { "jump_if_false", "no_story" },                            -- 5
+      { "show_text", "_PokemonFanClubChairmanStoryText" },        -- 6
       -- give-then-print like scripts/PokemonFanClub.asm (GiveItem
       -- fills wStringBuffer; the received text reads it)
-      { "give_item", "BIKE_VOUCHER", 1, false },                  -- 6
-      { "show_text", "_PokemonFanClubReceivedBikeVoucherText" },  -- 7
-      { "set_flag", "EVENT_RECEIVED_BIKE_VOUCHER" },              -- 8
-      { "show_text", "_PokemonFanClubExplainBikeVoucherText" },   -- 9
+      { "give_item", "BIKE_VOUCHER", 1, false },                  -- 7
+      { "show_text", "_PokemonFanClubReceivedBikeVoucherText" },  -- 8
+      { "set_flag", "EVENT_RECEIVED_BIKE_VOUCHER" },              -- 9
+      { "show_text", "_PokemonFanClubExplainBikeVoucherText" },   -- 10
+      { "jump", "end" },                                          -- 11
+      { "label", "no_story" },                                    -- 12
+      { "show_text", "_PokemonFanClubNoStoryText" },              -- 13
+      { "jump", "end" },                                          -- 14
+      -- .nothingleft: the gift is done, he only reminisces now
+      { "label", "nothing_left" },                                -- 15
+      { "show_text", "_PokemonFanClubChairFinalText" },           -- 16
     },
   },
 }
 
+-- BikeShopClerkText (scripts/BikeShop.asm) runs three ways: the BICYCLE is
+-- already yours, you are carrying the BIKE VOUCHER, or you get the sales
+-- pitch.  The pitch draws its own window (TextBoxBorder hlcoord 0,0, b=4
+-- c=15) holding BikeShopMenuText and BikeShopMenuPrice, and leaves it up
+-- while the clerk keeps talking in the bottom box: the original never
+-- erases it before TextScriptEnd (#568).
+local BikeShopWindow = {}
+BikeShopWindow.__index = BikeShopWindow
+
+function BikeShopWindow.new(game, footer, onChoose)
+  local self = setmetatable({}, BikeShopWindow)
+  self.game = game
+  self.onChoose = onChoose
+  self.index = 1
+  self.active = true
+  -- BikeShopClerkDoYouLikeItText stays on screen under the window for as
+  -- long as the menu is up.  The text box pushed on top types it out and
+  -- pops itself; this copy of its last page takes over from there, so the
+  -- bottom box never blanks between the pitch and the answer.  Paginated
+  -- with the themed column budget so the copy breaks where the box did.
+  local TextBox = require("src.render.TextBox")
+  local box = require("src.ui.Theme").textBox or {}
+  local pages = TextBox.paginate(TextBox.substitute(game, footer), box.maxCols)
+  self.footer = pages[#pages]
+  return self
+end
+
+function BikeShopWindow:update()
+  -- one answer only: the boxes pushed by onChoose sit on top of this
+  -- state, but a second A on the same frame must not fire it twice
+  if not self.active then return end
+  local input = self.game.input
+  -- HandleMenuInput with wMenuWrappingEnabled clear: the two rows clamp
+  if input:wasPressed("up") then
+    self.index = 1
+  elseif input:wasPressed("down") then
+    self.index = 2
+  elseif input:wasPressed("a") or input:wasPressed("b") then
+    local cancelled = input:wasPressed("b") -- bit B_PAD_B -> .cancel
+    require("src.core.Sound").play(self.game.data, "Press_AB")
+    self.active = false
+    self.onChoose(not cancelled and self.index == 1)
+  end
+end
+
+function BikeShopWindow:draw()
+  local Font = require("src.render.Font")
+  local Strings = require("src.core.Strings")
+  local Theme = require("src.ui.Theme")
+  Font.drawBox(0, 0, 17, 6)
+  love.graphics.setColor(0, 0, 0, 1)
+  local bike = self.game.data.items.BICYCLE
+  Font.draw(bike and bike.name or "BICYCLE", 16, 16)  -- hlcoord 2, 2
+  Font.draw("¥1000000", 64, 24)                       -- hlcoord 8, 3
+  Font.draw(Strings("CANCEL"), 16, 32)                -- `next` skips a row
+  -- wTopMenuItemX 1, wTopMenuItemY 2, rows two apart
+  Font.drawCode(Theme.cursor, 8, self.index == 1 and 16 or 32)
+  if self.footer then
+    -- same geometry TextBox resolves against, so a themed box matches
+    local box = Theme.textBox or {}
+    local tx, ty = box.tx or 0, box.ty or 12
+    love.graphics.setColor(1, 1, 1, 1)
+    Font.drawBox(tx, ty, box.tw or 20, box.th or 6)
+    love.graphics.setColor(0, 0, 0, 1)
+    for i, line in ipairs(self.footer) do
+      Font.draw(line, (tx + 1) * 8, (ty + 2 * i) * 8)
+    end
+  end
+  love.graphics.setColor(1, 1, 1, 1)
+end
+
 M.BIKE_SHOP = {
   talk = {
     TEXT_BIKESHOP_CLERK = function(game, ow, npc, done)
+      local Bag = require("src.inventory.Bag")
+      local Flags = require("src.script.Flags")
       local TextBox = require("src.render.TextBox")
-      if (game.save.inventory.BICYCLE or 0) > 0 then
-        game.stack:push(TextBox.new(game, "How's the\nBICYCLE treating\nyou?", done))
-      elseif (game.save.inventory.BIKE_VOUCHER or 0) > 0 then
-        game.save.inventory.BIKE_VOUCHER = nil
-        game.save.inventory.BICYCLE = 1
-        game.stack:push(TextBox.new(game,
-          ("Oh, that's a\nBIKE VOUCHER!\f%s exchanged\nit for a BICYCLE!")
-          :format(game.save.player.name), done))
-      else
-        game.stack:push(TextBox.new(game,
-          "A BICYCLE costs\n¥1000000. Sorry,\nno instalments!", done))
+      local t = game.data.text
+      local function say(text, after, opts)
+        game.stack:push(TextBox.new(game, text, after, opts))
       end
+
+      -- CheckEvent EVENT_GOT_BICYCLE.  Saves made before the clerk started
+      -- setting the event still have the bike in the bag, so either counts.
+      if (game.save.inventory.BICYCLE or 0) > 0
+          or Flags.get(game.save, "EVENT_GOT_BICYCLE") then
+        say(t._BikeShopClerkHowDoYouLikeYourBicycleText, done)
+        return
+      end
+
+      -- .dontHaveBike: IsItemInBag BIKE_VOUCHER
+      if (game.save.inventory.BIKE_VOUCHER or 0) > 0 then
+        say(t._BikeShopClerkOhThatsAVoucherText, function()
+          -- GiveItem's `jr nc, .BagFull`: the voucher is only spent once
+          -- the BICYCLE is actually in the bag
+          if not Bag.add(game.save, "BICYCLE", 1) then
+            say(t._BikeShopBagFullText, done)
+            return
+          end
+          Bag.remove(game.save, "BIKE_VOUCHER", 1)
+          Flags.set(game.save, "EVENT_GOT_BICYCLE")
+          -- BikeShopExchangedVoucherText carries sound_get_key_item; the
+          -- map runs EnableAutoTextBoxDrawing, so the box still waits for
+          -- a button once the jingle has played (auto.wait, #247)
+          say(t._BikeShopExchangedVoucherText, done, {
+            auto = { wait = true, sound = function()
+              return require("src.core.Sound").play(game.data, "Get_Key_Item")
+            end },
+          })
+        end)
+        return
+      end
+
+      -- .dontHaveVoucher: welcome, then the BICYCLE/CANCEL window
+      say(t._BikeShopClerkWelcomeText, function()
+        local pitch = t._BikeShopClerkDoYouLikeItText
+        game.stack:push(BikeShopWindow.new(game, pitch, function(bought)
+          local function comeAgain()
+            say(t._BikeShopComeAgainText, function()
+              game.stack:pop() -- the window, still up under the text
+              done()
+            end)
+          end
+          if bought then
+            -- a million is out of anyone's reach: BikeShopCantAffordText
+            say(t._BikeShopCantAffordText, comeAgain)
+          else
+            comeAgain()
+          end
+        end))
+        -- PrintText BikeShopClerkDoYouLikeItText, then straight into
+        -- HandleMenuInput: the box types out and hands over without
+        -- waiting, leaving the window's copy of the line on screen
+        say(pitch, nil, { auto = { delay = 0 } })
+      end)
     end,
   },
 }
@@ -486,8 +667,10 @@ local function mtMoonFossil(itemId, otherName, gotFlag)
       end
       local idef = game.data.items[itemId]
       game.stringBuffer = idef and idef.name or itemId
-      require("src.core.Sound").play(game.data, "Get_Key_Item")
       local dirs = mtMoonNerdWalk(ow.player.cellX, ow.player.cellY, itemId)
+      -- MtMoonB2FReceivedFossilText: text_far, sound_get_key_item,
+      -- text_waitbutton -- the jingle plays after the box has typed and
+      -- the button wait comes after it
       game.stack:push(TextBox.new(game,
         t._MtMoonB2FReceivedFossilText
           or ("{PLAYER} got the\n" .. game.stringBuffer .. "!"),
@@ -500,11 +683,11 @@ local function mtMoonFossil(itemId, otherName, gotFlag)
           ow.runner:run({
             { "walk_npc", 1, dirs },
             { "text_opts", { auto = true } },
+            { "text_sound", "Get_Key_Item" },
             { "show_text", "_MtMoonB2FSuperNerdThenThisIsMineText" },
-            { "play_sound", "Get_Key_Item" },
             { "hide_object", "MT_MOON_B2F", otherName },
           }, { onDone = done })
-        end))
+        end, TextBox.soundOpts(game, "Get_Key_Item")))
     end }))
   end
 end
@@ -520,6 +703,23 @@ M.MT_MOON_B2F = {
     return false
   end,
   talk = {
+    -- MtMoonB2FSuperNerdText: once beaten his line turns on the fossils
+    -- (scripts/MtMoonB2F.asm:187), which the header's flat `after` can't hold
+    TEXT_MTMOONB2F_SUPER_NERD = function(game, ow, npc, done)
+      if not superNerdBeaten(ow) then
+        engageSuperNerd(game, ow, done)
+        return
+      end
+      local TextBox = require("src.render.TextBox")
+      local t = game.data.text
+      local flags = game.save.flags
+      local line = (flags.EVENT_GOT_DOME_FOSSIL or flags.EVENT_GOT_HELIX_FOSSIL)
+        and (t._MtMoonB2FSuperNerdTheresAPokemonLabText
+             or "Far away, on\nCINNABAR ISLAND,\nthere's a POKéMON\nLAB.")
+        or (t._MtMoonB2fSuperNerdEachTakeOneText
+            or "We'll each take\none!\nNo being greedy!")
+      game.stack:push(TextBox.new(game, line, done))
+    end,
     TEXT_MTMOONB2F_DOME_FOSSIL = mtMoonFossil(
       "DOME_FOSSIL", "MTMOONB2F_HELIX_FOSSIL", "EVENT_GOT_DOME_FOSSIL"),
     TEXT_MTMOONB2F_HELIX_FOSSIL = mtMoonFossil(
@@ -527,35 +727,63 @@ M.MT_MOON_B2F = {
   },
 }
 
--- The ticket clerk (scripts/Museum1F.asm Museum1FScientist1Text):
--- Y50, once.  Declining at the rope shoves the player one tile SOUTH back off
--- the exhibit rope they crossed heading north (#151); the museum floor has no
--- ledges, so a plain scriptMove("down",1) is the correct primitive.
+-- The ticket clerk (scripts/Museum1F.asm Museum1FScientist1Text): Y50, once.
+-- Declining at the rope shoves the player one tile south (#151)
 local function museumClerk(game, ow, done, onDecline)
   local TextBox = require("src.render.TextBox")
-  local ChoiceBox = require("src.ui.ChoiceBox")
-  if game.save.flags.EVENT_BOUGHT_MUSEUM_TICKET then
+  local t = game.data.text or {}
+  local p = ow and ow.player
+  -- scripts/Museum1F.asm:45 (#1690)
+  if p and ((p.cellY == 4 and p.cellX == 13)
+            or (p.cellY == 3 and p.cellX == 12)) then
     game.stack:push(TextBox.new(game,
-      "Take your time,\nand enjoy it all!", done))
+      t._Museum1FScientist1DoYouKnowWhatAmberIsText
+        or "You can't sneak\nin the back way!\fOh, whatever!\nDo you know what\vAMBER is?",
+      nil, { choice = function(yes)
+        game.stack:push(TextBox.new(game, yes
+          and (t._Museum1FScientist1TheresALabSomewhereText
+               or "There's a lab\nsomewhere trying\vto resurrect\vancient POKéMON\vfrom AMBER.")
+          or (t._Museum1FScientist1AmberIsFossilizedTreeSapText
+              or "AMBER is fossil-\nized tree sap."), done))
+      end }))
     return
   end
+  if game.save.flags.EVENT_BOUGHT_MUSEUM_TICKET then
+    game.stack:push(TextBox.new(game,
+      t._Museum1FScientist1TakePlentyOfTimeText
+        or "Take your time,\nand enjoy it all!", done))
+    return
+  end
+  -- scripts/Museum1F.asm:58
+  if p and p.cellY ~= 4 then
+    game.stack:push(TextBox.new(game,
+      t._Museum1FScientist1GoToOtherSideText
+        or "Please go to the\nother side!", done))
+    return
+  end
+  -- scripts/Museum1F.asm:72
+  local money = function() return game.save.money end
   game.stack:push(TextBox.new(game,
-    "It's ¥50 for a\nchild's ticket.\fWould you like to\ncome in?", function()
-    game.stack:push(ChoiceBox.new(game, function(yes)
+    t._Museum1FScientist1WouldYouLikeToComeInText
+      or "It's ¥50 for a\nchild's ticket.\fWould you like to\ncome in?",
+    nil, { money = money, choice = function(yes)
       if yes and game.save.money >= 50 then
         game.save.money = game.save.money - 50
         game.save.flags.EVENT_BOUGHT_MUSEUM_TICKET = true
+        -- scripts/Museum1F.asm:106
         game.stack:push(TextBox.new(game,
-          "Right, ¥50!\nThank you!", done))
+          t._Museum1FScientist1ThankYouText or "Right, ¥50!\nThank you!", done,
+          { money = money }))
       elseif yes then
         game.stack:push(TextBox.new(game,
-          "You don't have\nenough money.", onDecline or done))
+          t._Museum1FScientist1DontHaveEnoughMoneyText
+            or "You don't have\nenough money.", onDecline or done, { money = money }))
       else
         game.stack:push(TextBox.new(game,
-          "Come again!", onDecline or done))
+          t._Museum1FScientist1ComeAgainText
+            or "Come again!", onDecline or done, { money = money }))
       end
-    end))
-  end))
+    end }))
 end
 
 M.MUSEUM_1F = {
@@ -565,7 +793,7 @@ M.MUSEUM_1F = {
     if y == 4 and (x == 9 or x == 10)
        and not game.save.flags.EVENT_BOUGHT_MUSEUM_TICKET then
       museumClerk(game, ow, nil, function()
-        ow:scriptMove(ow.player, "down", 1)
+        ow:scriptMove(ow.player, "down", 1, nil, { collide = true })
       end)
       return true
     end
@@ -648,25 +876,28 @@ M.CINNABAR_LAB_FOSSIL_ROOM = {
             "Where were you?\fYour fossil is\nback to life!\fIt was {RAM:x}\nlike I think!",
             subs),
           function()
-            if species then
-              local Commands = require("src.script.Commands")
-              local ctx = { save = game.save, game = game, overworld = ow }
-              Commands.give_pokemon(ctx, species, 30)
-              if not ctx.lastCheck then
-                -- GivePokemon failed (party+box full): pokered's
-                -- `jr nc, .done` leaves the quest pending so the
-                -- scientist re-offers the mon next visit instead of
-                -- destroying it.
-                game.stack:push(TextBox.new(game,
-                  t._BoxIsFullText or "Box is full!", done))
-                return
-              end
+            if not species then
+              game.save.labFossilMon = nil
+              f.EVENT_GAVE_FOSSIL_TO_LAB = nil
+              f.EVENT_LAB_STILL_REVIVING_FOSSIL = nil
+              f.EVENT_LAB_HANDING_OVER_FOSSIL_MON = nil
+              done()
+              return
             end
-            game.save.labFossilMon = nil
-            f.EVENT_GAVE_FOSSIL_TO_LAB = nil
-            f.EVENT_LAB_STILL_REVIVING_FOSSIL = nil
-            f.EVENT_LAB_HANDING_OVER_FOSSIL_MON = nil
-            done()
+            -- ../pokered/scripts/CinnabarLabFossilRoom.asm:74-83
+            ow.runner:run({
+              { "give_pokemon", species, 30, false, true },
+              { "jump_if_false", "boxfull" },
+              { "set_field", "labFossilMon" },
+              { "clear_flag", "EVENT_GAVE_FOSSIL_TO_LAB" },
+              { "clear_flag", "EVENT_LAB_STILL_REVIVING_FOSSIL" },
+              { "clear_flag", "EVENT_LAB_HANDING_OVER_FOSSIL_MON" },
+              { "jump", "out" },
+              { "label", "boxfull" },
+              -- ../pokered/engine/events/give_pokemon.asm:40-42
+              { "show_text", "_BoxIsFullText" },
+              { "label", "out" },
+            }, { onDone = done })
           end))
         return
       end
@@ -761,7 +992,7 @@ M.CINNABAR_LAB_FOSSIL_ROOM = {
 -- #118: do not raise mon.level until a paid retrieve (pokered reverts
 -- wDayCareMonBoxLevel on .leaveMonInDayCare). Fold pending steps into
 -- mon.exp once and clear them so a second talk cannot re-apply the same
--- walk. Fill {RAM:wNameBuffer}/{RAM:wDayCareMonName}/{NUM:...} here —
+-- walk. Fill {RAM:wNameBuffer}/{RAM:wDayCareMonName}/{NUM:...} here --
 -- TextBox.TOKENS.RAM only knows wStringBuffer.
 -- -------------------------------------------------------------------
 
@@ -782,10 +1013,19 @@ M.DAYCARE = {
       local t = game.data.text
       local dc = game.save.daycare
       local playerName = game.save.player and game.save.player.name or "RED"
+      local Sound = require("src.core.Sound")
 
       local function monName(mon)
         local def = game.data.pokemon[mon.species]
         return mon.nickname or (def and def.name) or mon.species
+      end
+
+      local function showMoney() return game.save.money end
+
+      -- pokeyellow scripts/Daycare.asm:54
+      local function isStarterPika(mon)
+        return require("src.core.GameVersion").isYellow()
+          and require("src.world.PikachuFollower").isStarterPikachu(game.save, mon)
       end
 
       if dc and dc.mon then
@@ -838,7 +1078,10 @@ M.DAYCARE = {
               t._DaycareGentlemanOweMoneyText
                 or "You owe me ¥{NUM:wDayCareTotalCost, 2 | LEADING_ZEROES | LEFT_ALIGN}\nfor the return\nof this POKéMON.",
               subs),
-            nil, { choice = function(yes)
+            nil, {
+            -- scripts/Daycare.asm:133
+            money = showMoney, moneyWithChoice = true,
+            choice = function(yes)
               if not yes then
                 -- .leaveMonInDayCare: revert any transient level bump
                 mon.level = startLevel
@@ -874,8 +1117,22 @@ M.DAYCARE = {
                   fillDaycareText(
                     t._DaycareGentlemanGotMonBackText
                       or "{PLAYER} got\n{RAM:wDayCareMonName} back!",
-                    subs), done))
-              end))
+                    subs), done, {
+                  money = showMoney,
+                  -- scripts/Daycare.asm:202
+                  preSound = function()
+                    -- pokeyellow scripts/Daycare.asm:229
+                    if isStarterPika(mon) then
+                      return Sound.playPikaCry(game.data, 35)
+                    end
+                    return Sound.playCry(game.data, mon.species)
+                  end }))
+              end, {
+                -- scripts/Daycare.asm:161
+                preSound = function()
+                  return Sound.play(game.data, "Purchase")
+                end,
+                money = showMoney }))
             end }))
         end))
         return
@@ -919,7 +1176,15 @@ M.DAYCARE = {
                     function()
                       game.stack:push(TextBox.new(game,
                         t._DaycareGentlemanComeSeeMeInAWhileText
-                          or "Come see me in\na while.", done))
+                          or "Come see me in\na while.", done, {
+                        -- scripts/Daycare.asm:58
+                        preSound = function()
+                          -- pokeyellow scripts/Daycare.asm:66
+                          if isStarterPika(mon) then
+                            return Sound.playPikaCry(game.data, 28)
+                          end
+                          return Sound.playCry(game.data, mon.species)
+                        end }))
                     end))
                 end,
               }))

@@ -1,10 +1,11 @@
 -- "Which move should be forgotten?",  replaces a move when a Pokémon with
 -- four moves learns a new one (engine/pokemon/learn_move.asm).  Opens
 -- with the TryingToLearnText "Delete an older move...?" YES/NO; HM moves
--- can't be forgotten; B / CANCEL gives up on the new move.
+-- can't be forgotten; B gives up on the new move.
 
 local Font = require("src.render.Font")
 local Strings = require("src.core.Strings")
+local romText = require("src.core.RomText")
 
 local MoveLearnMenu = {}
 MoveLearnMenu.__index = MoveLearnMenu
@@ -16,12 +17,13 @@ local HM_MOVES = {
   CUT = true, FLY = true, SURF = true, STRENGTH = true, FLASH = true,
 }
 
-function MoveLearnMenu.new(game, mon, newMoveId, onDone)
+function MoveLearnMenu.new(game, mon, newMoveId, onDone, learnedSound)
   local self = setmetatable({}, MoveLearnMenu)
   self.game = game
   self.mon = mon
   self.newMoveId = newMoveId
   self.onDone = onDone
+  self.learnedSound = learnedSound or "Get_Item1"
   self.index = 1
   -- forget-list UI only after TryingToLearn YES (learn_move.asm .loop)
   self.selecting = false
@@ -43,10 +45,13 @@ function MoveLearnMenu:enter()
   local mdef = game.data.moves[self.newMoveId]
   local name = self:monName()
   self.selecting = false
+  -- _TryingToLearnText is the whole exchange in pokered, delete prompt
+  -- included, so the extracted line carries all four slots at once
   game.stack:push(TextBox.new(game,
-    Strings("%s is\ntrying to learn\v%s!\fBut, %s\ncan't learn more\vthan 4 moves!\f",
-            name, mdef.name, name) ..
-    Strings("Delete an older\nmove to make room\vfor %s?", mdef.name),
+    romText(game.data, "_TryingToLearnText",
+      "%s is\ntrying to learn\v%s!\fBut, %s\ncan't learn more\vthan 4 moves!\f"
+      .. "Delete an older\nmove to make room\vfor %s?",
+      name, mdef.name, name, mdef.name),
     nil, {
       choice = function(yes)
         if yes then
@@ -61,7 +66,9 @@ end
 function MoveLearnMenu:update(dt)
   if not self.selecting then return end
   local input = self.game.input
-  local n = #self.mon.moves + 1 -- moves + CANCEL
+  -- wMaxMenuItem = wNumMovesMinusOne, no CANCEL row
+  -- engine/pokemon/learn_move.asm:144 (#1686)
+  local n = #self.mon.moves
   if input:wasPressed("up") then
     self.index = self.index > 1 and self.index - 1 or n
   elseif input:wasPressed("down") then
@@ -69,22 +76,19 @@ function MoveLearnMenu:update(dt)
   elseif input:wasPressed("b") then
     self:confirmAbandon()
   elseif input:wasPressed("a") then
-    if self.index > #self.mon.moves then
-      self:confirmAbandon()
-    else
-      local old = self.mon.moves[self.index]
-      if HM_MOVES[old.id] then
-        -- HMCantDeleteText, then back to the forget list
-        local TextBox = require("src.render.TextBox")
-        self.game.stack:push(TextBox.new(self.game,
-          Strings("HM techniques\ncan't be deleted!")))
-        return
-      end
-      local mdef = self.game.data.moves[self.newMoveId]
-      self.mon.moves[self.index] = { id = self.newMoveId, pp = mdef.pp }
-      self.forgot = self.game.data.moves[old.id].name
-      self:finish(true)
+    local old = self.mon.moves[self.index]
+    if HM_MOVES[old.id] then
+      -- HMCantDeleteText, then back to the forget list
+      local TextBox = require("src.render.TextBox")
+      self.game.stack:push(TextBox.new(self.game,
+        romText(self.game.data, "_HMCantDeleteText",
+          "HM techniques\ncan't be deleted!")))
+      return
     end
+    local mdef = self.game.data.moves[self.newMoveId]
+    self.mon.moves[self.index] = { id = self.newMoveId, pp = mdef.pp }
+    self.forgot = self.game.data.moves[old.id].name
+    self:finish(true)
   end
 end
 
@@ -97,7 +101,8 @@ function MoveLearnMenu:confirmAbandon()
   local mdef = game.data.moves[self.newMoveId]
   self.selecting = false
   game.stack:push(TextBox.new(game,
-    Strings("Abandon learning\n%s?", mdef.name), nil, {
+    romText(game.data, "_AbandonLearningText",
+      "Abandon learning\n%s?", mdef.name), nil, {
       choice = function(yes)
         if yes then self:finish(false) else self:enter() end
       end,
@@ -112,30 +117,41 @@ function MoveLearnMenu:finish(learned)
   self.selecting = false
   game.stack:pop()
   local msg
+  local opts
   if learned then
-    -- OneTwoAndText/PoofText/ForgotAndText
-    msg = Strings("1, 2 and... Poof!\f%s forgot\n%s!\fAnd...\f%s learned\n%s!",
-                  name, self.forgot, name, mdef.name)
+    -- pokered pages this as four texts in a row; _ForgotAndText carries
+    -- the "And..." tail.  Each text_pause holds the box, and the first one
+    -- is followed by SFX_SWAP (engine/pokemon/learn_move.asm:208-222).
+    msg = romText(game.data, "_OneTwoAndText", "1, 2 and...")
+      .. TextBox.PAUSE
+      .. romText(game.data, "_PoofText", " Poof!")
+      .. TextBox.PAUSE
+      .. romText(game.data, "_ForgotAndText",
+           "\f%s forgot\n%s!\fAnd...", name, self.forgot)
+      .. "\f" .. romText(game.data, "_LearnedMove1Text",
+           "%s learned\n%s!", name, mdef.name)
+    opts = { pauseSounds = { "Swap" }, auto = { sound = function()
+      return require("src.core.Sound").play(game.data, self.learnedSound)
+    end, wait = true } }
   else
-    -- DidNotLearnText
-    msg = Strings("%s\ndid not learn\v%s!", name, mdef.name)
+    msg = romText(game.data, "_DidNotLearnText",
+      "%s\ndid not learn\v%s!", name, mdef.name)
   end
   game.stack:push(TextBox.new(game, msg, function()
     if self.onDone then self.onDone(learned) end
-  end))
+  end, opts))
 end
 
 function MoveLearnMenu:draw()
   if not self.selecting then return end
-  -- single-spaced move list box (TryingToLearn: TextBoxBorder at 4,7)
-  -- plus the port's extra CANCEL row
-  Font.drawBox(4, 5, 16, 7)
+  -- TextBoxBorder 4,7 b=4 c=14; PlaceString 6,8; cursor 5,8
+  -- engine/pokemon/learn_move.asm:123-140 (#1686)
+  Font.drawBox(4, 7, 16, 6)
   love.graphics.setColor(0, 0, 0, 1)
   for i, mv in ipairs(self.mon.moves) do
-    Font.draw(self.game.data.moves[mv.id].name, 48, (5 + i) * 8)
+    Font.draw(self.game.data.moves[mv.id].name, 48, (7 + i) * 8)
   end
-  Font.draw(Strings("CANCEL"), 48, (6 + #self.mon.moves) * 8)
-  Font.drawCode(CURSOR, 40, (5 + self.index) * 8)
+  Font.drawCode(CURSOR, 40, (7 + self.index) * 8)
   -- WhichMoveToForgetText in the bottom dialogue box
   Font.drawBox(0, 12, 20, 6)
   Font.draw(Strings("Which move should"), 8, 14 * 8)

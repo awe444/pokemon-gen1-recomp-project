@@ -41,6 +41,34 @@ local function badgeBoost(battler, stat)
   return nil
 end
 
+-- engine/battle/core.asm:6454
+function Damage.applyBadgeBoost(battler, stat, value)
+  if battler.hazeStatReset then return value end
+  local row = badgeBoost(battler, stat)
+  if not row then return value end
+  local extra = battler.badgeExtraBoosts and battler.badgeExtraBoosts[stat] or 0
+  for _ = 1, 1 + extra do
+    value = math.min(999, math.floor(value * (row.num or 9) / (row.den or 8)))
+  end
+  return value
+end
+
+-- engine/battle/effects.asm:498,689
+function Damage.reapplyBadgeBoosts(battler, changedStat)
+  if not battler or not battler.badges then return end
+  local extra = battler.badgeExtraBoosts
+  if not extra then extra = {} battler.badgeExtraBoosts = extra end
+  for _, row in ipairs(battler.badgeBoosts or Damage.BADGE_BOOSTS) do
+    if battler.badges[row.badge] then
+      if row.stat == changedStat then
+        extra[row.stat] = 0
+      else
+        extra[row.stat] = (extra[row.stat] or 0) + 1
+      end
+    end
+  end
+end
+
 -- the merged status record for a battler's persistent condition, or nil
 local function statusRecord(battler)
   return Status.recordFor(battler.statuses, battler.mon.status)
@@ -83,25 +111,35 @@ function Damage.critRoll(ruleset, attacker, moveId, rng, highCrit)
   return rng(0, 255) < b
 end
 
--- Accuracy test: rand(0..255) < floor(accuracy * 255 / 100) adjusted by
--- accuracy/evasion stages.  With oneIn256Miss a max-accuracy move still
--- misses on 255.
-function Damage.accuracyRoll(ruleset, move, attacker, defender, rng)
-  rng = rng or love.math.random
+-- Exact number of the 256 RNG outcomes that pass MoveHitTest.  Keeping the
+-- threshold public lets read-only UIs preview the same rules the roll uses.
+function Damage.accuracyThreshold(ruleset, move, attacker, defender)
   -- X ACCURACY sets USING_X_ACCURACY: the move simply never misses
   -- (MoveHitTest returns before any accuracy math, 1/256 included)
-  if attacker.xAccuracy then return true end
+  if attacker.xAccuracy then return 256 end
   local acc = math.floor(move.accuracy * 255 / 100)
+  local accuracyStage = attacker.stages and attacker.stages.accuracy or 0
+  local evasionStage = defender.stages and defender.stages.evasion or 0
   -- CalcHitChance scales by the accuracy stage and the evasion stage as
   -- two separate ratio multiplications, clamping each result
-  acc = math.min(255, Stats.applyStage(acc,
-          attacker.stages and attacker.stages.accuracy or 0))
-  acc = math.min(255, Stats.applyStage(acc,
-          -(defender.stages and defender.stages.evasion or 0)))
+  acc = math.min(255, Stats.applyStage(acc, accuracyStage))
+  acc = math.min(255, Stats.applyStage(acc, -evasionStage))
   if not ruleset.oneIn256Miss and move.accuracy >= 100
-     and (attacker.stages.accuracy or 0) >= (defender.stages.evasion or 0) then
-    return true
+     and accuracyStage >= evasionStage then
+    return 256
   end
+  return acc
+end
+
+function Damage.accuracyChance(ruleset, move, attacker, defender)
+  return Damage.accuracyThreshold(ruleset, move, attacker, defender) * 100 / 256
+end
+
+-- Accuracy test: rand(0..255) < the shared ruleset-aware threshold.
+function Damage.accuracyRoll(ruleset, move, attacker, defender, rng)
+  rng = rng or love.math.random
+  local acc = Damage.accuracyThreshold(ruleset, move, attacker, defender)
+  if acc == 256 then return true end
   return rng(0, 255) < acc
 end
 
@@ -168,14 +206,8 @@ function Damage.compute(ruleset, attacker, defender, move, opts)
     -- badge boosts (x9/8), engine/battle/core.asm ApplyBadgeStatBoosts:
     -- Boulder -> attack, Thunder -> defense, Soul -> speed (TurnOrder),
     -- Volcano -> special
-    local atkBoost = badgeBoost(attacker, atkStat)
-    if atkBoost then
-      atk = math.floor(atk * (atkBoost.num or 9) / (atkBoost.den or 8))
-    end
-    local defBoost = badgeBoost(defender, defStat)
-    if defBoost then
-      dfn = math.floor(dfn * (defBoost.num or 9) / (defBoost.den or 8))
-    end
+    atk = Damage.applyBadgeBoost(attacker, atkStat, atk)
+    dfn = Damage.applyBadgeBoost(defender, defStat, dfn)
     -- burn halves physical attack (applied as part of the stat in Gen 1;
     -- the status record's statPenalty names the stat it cuts).
     -- hazeStatReset suppresses it: Haze (haze.asm ResetStats) copied the

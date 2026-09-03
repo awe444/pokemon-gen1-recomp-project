@@ -86,6 +86,43 @@ def parse_super_rod(pokered):
     return out
 
 
+def parse_super_rod_yellow(pokeyellow):
+    """pokeyellow data/wild/super_rod.asm: inline species,level rows.
+
+    Yellow stores four (species, level) pairs per map on one `db` line
+    (`db MAP, SPECIES, LEVEL, SPECIES, LEVEL, ...`), unlike Red's
+    `dbw MAP, .Group` + `db level, species` groups.  Slot order is kept
+    so Super Rod weighted rolls and DexNav lists stay faithful (#1074).
+    """
+    out = {}
+    path = os.path.join(pokeyellow, "data/wild/super_rod.asm")
+    for lineno, line in read_asm(path):
+        s = line.strip()
+        if not s.startswith("db ") or s == "db -1" or s.startswith("db -1 ;"):
+            continue
+        # db MAP, SPECIES, LEVEL, SPECIES, LEVEL, SPECIES, LEVEL, SPECIES, LEVEL
+        parts = [p.strip() for p in s[3:].split(",")]
+        if len(parts) < 3 or not re.match(r"^[A-Z][A-Z0-9_]*$", parts[0]):
+            continue
+        map_id = parts[0]
+        slots = []
+        rest = parts[1:]
+        i = 0
+        while i + 1 < len(rest):
+            species, level = rest[i], rest[i + 1]
+            if not re.match(r"^[A-Z][A-Z0-9_]*$", species):
+                break
+            try:
+                level_n = int(level)
+            except ValueError:
+                break
+            slots.append({"level": level_n, "species": species})
+            i += 2
+        if slots:
+            out[map_id] = slots
+    return out
+
+
 def parse_trades(pokered):
     """data/events/trades.asm: npctrade give, get, dialogset, nickname."""
     # TRADE_DIALOGSET_* order (constants/script_constants.asm) indexes
@@ -755,14 +792,14 @@ def parse_badge_gates(pokered):
 
 
 def parse_preset_names(pokered):
-    """constants/player_constants.asm: the _RED preset name menus.
+    """constants/player_constants.asm: preset name menus.
 
     The naming menus (engine/movie/oak_speech/oak_speech2.asm with
     data/player/names.asm / names_list.asm) offer NEW NAME plus these
-    three presets each.
+    three presets each.  Red/Blue gate the lists with IF DEF(_RED)/_BLUE;
+    Yellow ships a single ungated set (YELLOW/ASH/JACK, BLUE/GARY/JOHN).
+    read_asm resolves version conditionals via util.ASM_DEFINES.
     """
-    # read_asm resolves the version conditionals (util.ASM_DEFINES), so
-    # only the _RED name set reaches us
     player, rival = [], []
     path = os.path.join(pokered, "constants/player_constants.asm")
     for lineno, line in read_asm(path):
@@ -1116,24 +1153,16 @@ def parse_credits(pokered):
         os.path.join(pokered, "constants/credits_constants.asm"),
         stop_at="NUM_CRED_STRINGS")
 
-    # CreditsTextPointers: CRED_* value -> string label
+    # CreditsTextPointers: CRED_* value -> string label.
+    # Version-gated CredVersion / CreditsText_Version bodies (Red/Blue IF
+    # DEF) are resolved by read_asm via util.ASM_DEFINES; Yellow has no
+    # gates and a single "YELLOW VERSION" string.
     pointers = []
     strings = {}
-    skip = False
     label = None
     path = os.path.join(pokered, "data/credits/credits_text.asm")
     for lineno, line in read_asm(path):
         s = line.strip()
-        if re.match(r"IF\s+DEF\(_RED\)", s):
-            continue
-        if re.match(r"IF\s+DEF\(", s):
-            skip = True
-            continue
-        if s == "ENDC":
-            skip = False
-            continue
-        if skip:
-            continue
         m = re.match(r"dw\s+(\w+)$", s)
         if m:
             pointers.append(m.group(1))
@@ -1142,6 +1171,7 @@ def parse_credits(pokered):
         if m and m.group(1) != "CreditsTextPointers":
             label = m.group(1)
             continue
+        # Optional trailing @ terminator (Yellow omits it on some lines).
         m = re.match(r'db\s+(-\d+),\s*"([^"]*)"$', s)
         if m and label:
             strings[label] = {
@@ -1445,9 +1475,20 @@ def extract(pokered, out_dir):
        or badge_gates["ROUTE_23"]["guards"][-1]["badge"] != "CASCADEBADGE" \
        or len(badge_gates["ROUTE_22_GATE"]["coords"]) != 2:
         util.die("badge gate extraction sanity check failed")
-    if "RED" not in preset_names["player"] or "BLUE" not in preset_names["rival"] \
-       or len(preset_names["player"]) != 3 or len(preset_names["rival"]) != 3:
+    if len(preset_names["player"]) != 3 or len(preset_names["rival"]) != 3:
         util.die("preset name extraction sanity check failed")
+    # Red expects RED/ASH/JACK + BLUE/GARY/JOHN. Yellow ships YELLOW/... with
+    # no IF DEF gates; Blue swaps player/rival. Only enforce the Red pair when
+    # building Red (ASM_DEFINES has _RED) or when RED already appears.
+    if "_RED" in util.ASM_DEFINES or "RED" in preset_names["player"]:
+        if "YELLOW" in preset_names["player"]:
+            pass  # pokeyellow ungated presets; Red name check does not apply
+        elif "RED" not in preset_names["player"] \
+                or "BLUE" not in preset_names["rival"]:
+            util.die("preset name extraction sanity check failed")
+    elif "YELLOW" in preset_names["player"]:
+        if "BLUE" not in preset_names["rival"]:
+            util.die("preset name extraction sanity check failed")
     if "ROCK_TUNNEL_1F" not in dark_maps["maps"]:
         util.die("dark map extraction sanity check failed")
     if warp_carpets["tiles"]["down"] != [0x01, 0x12, 0x17, 0x3D, 0x04, 0x18, 0x33] \
@@ -1467,9 +1508,11 @@ def extract(pokered, out_dir):
         util.die("bike riding tileset extraction sanity check failed")
     if indoor_encounters["firstIndoorMap"] != 0x25:
         util.die("indoor encounter boundary sanity check failed")
-    if len(title) != 5 or any(not v["width"] for v in title.values()) \
+    if len(title) not in (5, 6) or any(not v["width"] for v in title.values()) \
        or (title["gamefreakInc"]["width"],
-           title["gamefreakInc"]["height"]) != (72, 8):
+           title["gamefreakInc"]["height"]) != (72, 8) \
+       or ("nine" in title and (title["nine"]["width"],
+                                title["nine"]["height"]) != (8, 8)):
         util.die("title asset extraction sanity check failed")
     if any((intro["gengar"][f]["width"], intro["gengar"][f]["height"])
            != (56, 56) for f in ("frame1", "frame2", "frame3")) \

@@ -9,33 +9,52 @@
 -- cable pull.
 --
 -- Cable rules: no experience, no money, no items; either side may RUN
--- (a draw); a fainted mon is auto-replaced by the next healthy party
--- member (the original prompts; documented divergence).  Badge stat
--- boosts don't apply on either side (divergence: Gen 1 famously kept
--- them in link battles).
+-- (a draw); a fainted mon is replaced from the party menu and the chosen
+-- slot rides the wire, the way ChooseNextMon hands it to
+-- LinkBattleExchangeData.  Badge stat boosts don't apply on either side
+-- (divergence: Gen 1 famously kept them in link battles).
 
 local Fingerprint = require("src.link.Fingerprint")
 local Font = require("src.render.Font")
 local Handshake = require("src.link.Handshake")
 local Logger = require("src.core.Logger")
+local Party = require("src.pokemon.Party")
 local Protocol = require("src.link.Protocol")
 local Runtime = require("src.mods.Runtime")
 local TurnOrder = require("src.battle.TurnOrder")
 local Strings = require("src.core.Strings")
+local Timing = require("src.core.Timing")
 
 local LinkBattle = {}
 
 -- Deterministic Park-Miller PRNG: both sides must roll identical
 -- streams, so love.math.random can't be used.
-local function makeRng(seed)
-  local s = seed % 2147483647
+local function makeRng(seed, owner)
+  local s = tonumber(seed) or 1
+  if s ~= s or s == math.huge or s == -math.huge then s = 1 end
+  s = math.floor(s) % 2147483647
   if s <= 0 then s = s + 2147483646 end
+  if owner then owner.rngDraws = 0 end
   return function(a, b)
+    if owner then owner.rngDraws = (owner.rngDraws or 0) + 1 end
     s = (s * 16807) % 2147483647
     if a == nil then return s / 2147483647 end
     if b == nil then a, b = 1, a end
     return a + (s % (b - a + 1))
   end
+end
+
+local BUILTIN_RULESETS = {
+  gen1_faithful = require("src.battle.rulesets.gen1_faithful"),
+  modern_clean = require("src.battle.rulesets.modern_clean"),
+}
+
+local function rulesetFor(game, id)
+  local rulesets = game.data.rulesets or BUILTIN_RULESETS
+  local fallback = (game.data.constants and game.data.constants.defaultRuleset)
+                   or "gen1_faithful"
+  return (id and rulesets[id]) or rulesets[fallback]
+         or BUILTIN_RULESETS.gen1_faithful
 end
 
 -- Battlers go through BattleState.makeBattler so pics get the same
@@ -112,6 +131,19 @@ local function scalar(v)
   return tostring(v)
 end
 
+-- A volatile slot is "off" three interchangeable ways -- absent, false, or
+-- a counter sitting at 0 -- because every reader tests `if b.key then` or
+-- `key > 0`.  They have to hash the same, or a match ends over a difference
+-- that does not exist.  They routinely disagree: the menu-phase flinch
+-- clear (BattleState:update) and the FIGHT-branch boundTurns mirror
+-- (fightLockedAction) are written by whichever machine is sitting at ITS
+-- OWN menu, and in a link battle that is a different battler on each side,
+-- so one peer holds flinched=false / boundTurns=0 where the other still
+-- holds nil with two identical simulations underneath.
+local function off(v)
+  return v == nil or v == false or v == 0
+end
+
 local function stageStr(b)
   local out = {}
   for i, stat in ipairs(STAGES) do
@@ -131,7 +163,7 @@ end
 local function volStr(b)
   local out = {}
   for _, key in ipairs(VOLATILE) do
-    if b[key] ~= nil then
+    if not off(b[key]) then
       out[#out + 1] = key .. "=" .. scalar(b[key])
     end
   end
@@ -160,7 +192,8 @@ local function stateSig(self, role, myParty, theirParty)
   local hostParty = role == "host" and myParty or theirParty
   local guestParty = role == "host" and theirParty or myParty
   return {
-    actives = Fingerprint.digest(activeStr(host) .. "|" .. activeStr(guest)),
+    actives = Fingerprint.digest(activeStr(host) .. "|" .. activeStr(guest)
+                                 .. "|r" .. tostring(self.rngDraws or 0)),
     volatile = Fingerprint.digest(volStr(host) .. "|" .. volStr(guest)),
     bench = Fingerprint.digest(benchStr(hostParty) .. "|" .. benchStr(guestParty)),
   }
@@ -168,8 +201,19 @@ end
 
 local PARTS = { "actives", "volatile", "bench" }
 
+-- Which components are allowed to end a match.  `actives` and `bench` carry
+-- what decides one -- species, HP, status, stat stages, PP, the rest of the
+-- party -- so a divergence there is a real split between the two
+-- simulations and stays a draw.  `volatile` is per-turn bookkeeping that
+-- both sides recompute from the authoritative state every turn (see `off`
+-- above): it can disagree for a turn without either side being wrong, and
+-- when it does mean something real it lands in `actives` as damage or
+-- status within a turn or two, where it is caught.  Ending a match on it
+-- alone cost players games they were winning, over nothing.
+local FATAL_PART = { actives = true, bench = true }
+
 -- opts: { myParty = packed, theirParty = packed, theirName, role =
--- "host"/"guest", seed, verdict, strict }.  Returns nil plus a reason when
+-- "host"/"guest", seed, ruleset, verdict, strict }.  Returns nil plus a reason when
 -- the handshake says the two link surfaces don't match: a lockstep
 -- simulation of two different rulebooks can only end in a bogus draw.
 function LinkBattle.new(game, net, opts)
@@ -178,7 +222,7 @@ function LinkBattle.new(game, net, opts)
   local theirName = opts.theirName or "FOE"
 
   if not Handshake.battleAllowed(opts.verdict) then
-    return nil, Strings("Link battle needs\nthe same mods on\nboth games.")
+    return nil, Strings("Link battle needs\nthe same version\nand mods.")
   end
 
   -- both parties pass through the same pack->unpack clamp on both
@@ -227,13 +271,18 @@ function LinkBattle.new(game, net, opts)
   -- back up and the link can stall or time out. Game:step services
   -- game.linkNet unconditionally every frame.
   game.linkNet = net
-  self.rng = makeRng(opts.seed or 1)
+  self.rng = makeRng(opts.seed or 1, self)
+  self.rulesetId = opts.ruleset
+  self.ruleset = rulesetFor(game, opts.ruleset)
   self.player = mkBattler(game.data, myParty[1], true)
   self.enemy = mkBattler(game.data, theirParty[1], false)
   self.enemyParty = theirParty
   self.playerParty = myParty -- intro ball row uses the clamped copies
   self.opponentName = theirName
-  self.introText = Strings("%s wants\nto battle!", theirName)
+  -- _TrainerWantsToFightText (data/text/text_2.asm:1257): wIsInBattle == 2
+  -- takes PrintBeginningBattleText's .trainerBattle arm, link included
+  self.introText = self:romText("_TrainerWantsToFightText",
+    "%s wants\nto fight!", theirName)
   self.remoteHashes = {}
   self.localHashes = {}
   self.remoteParts = {}
@@ -303,6 +352,75 @@ function LinkBattle.new(game, net, opts)
     end)
   end
 
+  -- ChooseNextMon (engine/battle/core.asm:1086-1103): the replacement after
+  -- a faint is a free party-menu pick in a link battle too -- DisplayPartyMenu
+  -- runs first, a fainted pick or a cancel goes back to it
+  -- (.goBackToPartyMenu), and only the chosen slot rides
+  -- LinkBattleExchangeData.
+  local function chooseReplacement(s)
+    s.linkReplacement = nil
+    s:uiNext(function()
+      return s:buildScreen("PartyMenu", {
+        battle = s,
+        party = myParty,
+        forceSwitch = true,
+        keepOpen = true,
+        onSwitch = function(mon, menu)
+          -- engine/battle/core.asm:1473-1488
+          if mon.hp <= 0 then
+            if menu then menu:refuse(Strings("There's no will\nto fight!")) end
+            return
+          end
+          s.linkReplacement = mon
+          if menu then menu:close() end
+        end,
+      })
+    end)
+    s:actNext(function()
+      local mon = s.linkReplacement
+      s.linkReplacement = nil
+      if s.result then return end
+      if not mon then
+        chooseReplacement(s)
+        return
+      end
+      for i, m in ipairs(myParty) do
+        if m == mon then send({ type = "replace", index = i }) break end
+      end
+      sendOutPlayer(s, mon)
+    end)
+  end
+
+  -- ReplaceFaintedEnemyMon (core.asm:892-905) reads the peer's slot back out
+  -- of the exchange, and EnemySendOutFirstMon (core.asm:1315-1320) decodes it
+  -- as wSerialExchangeNybbleReceiveData - 4.  HandlePlayerMonFainted
+  -- (core.asm:989-996) always runs ChooseNextMon BEFORE that read, so on a
+  -- double faint both machines commit their own slot before they block on the
+  -- peer's; our queue can reach the enemy's handler first, so the wait
+  -- pre-empts itself with the local pick rather than deadlocking on a message
+  -- neither side is going to send.
+  local function awaitReplacement(s)
+    s:actNext(function()
+      if s.result then return end
+      if s.player.mon.hp <= 0 and not s.linkChoiceQueued
+         and Party.firstHealthy(myParty) then
+        s.linkChoiceQueued = true
+        chooseReplacement(s)
+        awaitReplacement(s)
+        return
+      end
+      local idx = s.remoteReplace
+      if not idx then
+        awaitReplacement(s)
+        return
+      end
+      s.remoteReplace = nil
+      local mon = theirParty[idx]
+      if not mon or mon.hp <= 0 then mon = Party.firstHealthy(theirParty) end
+      sendOutEnemy(s, mon)
+    end)
+  end
+
   -- decode a remote action message against the enemy battler
   local function decodeTheirAction(s, msg)
     return decodeWireAction(s, msg, s.enemy)
@@ -315,10 +433,21 @@ function LinkBattle.new(game, net, opts)
     Logger.warn("link: desync turn %s component=%s (%s vs %s)",
                 tostring(turn), component, tostring(localH), tostring(remoteH))
     Runtime.emit("link.desync", { turn = turn, component = component,
-                                  localHash = localH, remoteHash = remoteH })
+                                  localHash = localH, remoteHash = remoteH,
+                                  fatal = true })
     endAsDraw(s, Strings(
-      "Link desync!\n%s differs.\fAre both games\nrunning the same\nmods?",
+      "Link desync!\n%s differs.\fAre both games\nthe same version\nand mods?",
       component))
+  end
+
+  -- a non-fatal component split: both sides log it and carry on, so the
+  -- match is decided by the battle rather than by bookkeeping
+  local function noteDrift(s, turn, component, localH, remoteH)
+    Logger.warn("link: %s drift on turn %s (%s vs %s) -- match continues",
+                component, tostring(turn), tostring(localH), tostring(remoteH))
+    Runtime.emit("link.desync", { turn = turn, component = component,
+                                  localHash = localH, remoteHash = remoteH,
+                                  fatal = false })
   end
 
   -- a verified turn stays recorded: consuming it here left a finished
@@ -333,8 +462,11 @@ function LinkBattle.new(game, net, opts)
         if mine and theirs then
           for _, component in ipairs(PARTS) do
             if mine[component] ~= theirs[component] then
-              reportDesync(s, turn, component, mine[component], theirs[component])
-              return
+              if FATAL_PART[component] then
+                reportDesync(s, turn, component, mine[component], theirs[component])
+                return
+              end
+              noteDrift(s, turn, component, mine[component], theirs[component])
             end
           end
         end
@@ -367,11 +499,22 @@ function LinkBattle.new(game, net, opts)
     -- switches happen before attacks (both may switch)
     if myMsg.kind == "switch" then
       local idx = myMsg.index
-      s:act(function() sendOutPlayer(s, myParty[idx]) end)
+      -- SwitchPlayerMon (engine/battle/core.asm:2419-2423); a post-faint
+      -- replacement shares sendOutPlayer and prints neither line
+      s:act(function()
+        s:sayNextAuto(s:withdrawText(s.player.name), Timing.SWITCH_PLAYER_MON)
+        s:queueRetreatAnim()
+        s:actNext(function() sendOutPlayer(s, myParty[idx]) end)
+      end)
       myAction = nil
     end
     if theirSwitch then
-      s:act(function() sendOutEnemy(s, theirParty[theirSwitch]) end)
+      -- SwitchEnemyMon (engine/battle/trainer_ai.asm:596-599)
+      s:act(function()
+        s:sayNext(s:romText("_AIBattleWithdrawText", "%s with-\ndrew %s!",
+          theirName, s.enemy.name))
+        s:actNext(function() sendOutEnemy(s, theirParty[theirSwitch]) end)
+      end)
     end
 
     s:act(function()
@@ -479,14 +622,21 @@ function LinkBattle.new(game, net, opts)
       return s:buildScreen("PartyMenu", {
         battle = s,
         party = myParty,
-        onSwitch = function(mon)
+        keepOpen = true,
+        onSwitch = function(mon, menu)
+          -- engine/battle/core.asm:2329
+          local refusal
           if mon == s.player.mon then
-            s:say(Strings("%s is\nalready out!", s.player.name))
+            refusal = Strings("%s is\nalready out!", s.player.name)
           elseif mon.hp <= 0 then
-            s:say(Strings("There's no will\nto fight!"))
-          else
-            s:resolveSwitch(mon)
+            refusal = Strings("There's no will\nto fight!")
           end
+          if refusal then
+            if menu then menu:refuse(refusal) else s:say(refusal) end
+            return
+          end
+          if menu then menu:close() end
+          s:resolveSwitch(mon)
         end,
       })
     end)
@@ -502,12 +652,17 @@ function LinkBattle.new(game, net, opts)
     submit(s, { type = "action", kind = "run" }, nil)
   end
 
-  -- fainted mons auto-replace with the next healthy teammate, in party
-  -- order, identically on both machines
+  -- linkChoiceQueued: awaitReplacement already pre-empted itself with this
+  -- side's ChooseNextMon and put the slot on the wire, so the handler the
+  -- faint queued has nothing left to do but drop the flag
   self.playerMonFainted = function(s)
+    if s.linkChoiceQueued then
+      s.linkChoiceQueued = nil
+      return
+    end
     for _, mon in ipairs(myParty) do
       if mon.hp > 0 then
-        s:act(function() sendOutPlayer(s, mon) end)
+        if not s.result then chooseReplacement(s) end
         return
       end
     end
@@ -520,7 +675,7 @@ function LinkBattle.new(game, net, opts)
   self.enemyMonFainted = function(s)
     for _, mon in ipairs(theirParty) do
       if mon.hp > 0 then
-        s:act(function() sendOutEnemy(s, mon) end)
+        if not s.result then awaitReplacement(s) end
         return
       end
     end
@@ -541,6 +696,9 @@ function LinkBattle.new(game, net, opts)
         s.remoteHashes[msg.turn or 0] = msg.value
         s.remoteParts[msg.turn or 0] = msg.parts
         checkHashes(s)
+      elseif msg.type == "replace" then
+        local idx = math.floor(tonumber(msg.index) or 1)
+        s.remoteReplace = math.max(1, math.min(#theirParty, idx))
       elseif msg.type == "bye" then
         -- only a draw if our own simulation hasn't already decided
         -- (the winner's bye can arrive while we're still animating)
@@ -565,10 +723,19 @@ function LinkBattle.new(game, net, opts)
     if net.closed and not s.linkEnded and not s.result then
       endAsDraw(s)
     end
+    -- Both early returns below skip baseUpdate, which is where the
+    -- presentational clock normally advances -- so tick it here, in the same
+    -- order baseUpdate would (fx, then the queue).  Without this an
+    -- animation caught mid-flight froze for the whole wait: a flash stopped
+    -- on its inverted BGP step and repainted the UI in inverted shades, and
+    -- a pic part-way through a slide or grow-in stayed off screen, which is
+    -- the "the screen went inverted" / "a Pokemon just vanished" pair.
     if s.phase == "waitRemote" then
+      s:tickFx()
       return -- the other side is still choosing
     end
     if s.phase == "messages" and s.afterQueue == "linkNext" then
+      s:tickFx()
       if not s:updateQueue() then
         s.afterQueue = "menu"
         s.phase = "menu"
@@ -616,8 +783,8 @@ function LinkBattle.new(game, net, opts)
     -- the whole tournament, not just this match.
     if not opts.keepNetOpen then
       net:close()
+      if game.linkNet == net then game.linkNet = nil end
     end
-    if game.linkNet == net then game.linkNet = nil end
     baseFinish(s)
   end
 
@@ -645,7 +812,7 @@ function LinkBattle.newSpectator(game, net, opts)
   local guestName = opts.guestName or "GUEST"
 
   if not Handshake.battleAllowed(opts.verdict) then
-    return nil, Strings("Link battle needs\nthe same mods on\nboth games.")
+    return nil, Strings("Link battle needs\nthe same version\nand mods.")
   end
 
   local unpackOpts = { strict = opts.strict or false, forceLevel = opts.forceLevel }
@@ -667,7 +834,9 @@ function LinkBattle.newSpectator(game, net, opts)
   self.spectating = true -- Tournament.lua's marker: don't report a result for this one
   self.net = net
   game.linkNet = net
-  self.rng = makeRng(opts.seed or 1)
+  self.rng = makeRng(opts.seed or 1, self)
+  self.rulesetId = opts.ruleset
+  self.ruleset = rulesetFor(game, opts.ruleset)
   self.player = mkBattler(game.data, hostParty[1], true)
   self.enemy = mkBattler(game.data, guestParty[1], false)
   self.enemyParty = guestParty
@@ -723,6 +892,34 @@ function LinkBattle.newSpectator(game, net, opts)
     end)
   end
 
+  local function awaitHostReplacement(s)
+    s:actNext(function()
+      if s.result then return end
+      local idx = table.remove(s.hostReplace, 1)
+      if not idx then
+        awaitHostReplacement(s)
+        return
+      end
+      local mon = hostParty[idx]
+      if not mon or mon.hp <= 0 then mon = Party.firstHealthy(hostParty) end
+      sendOutHost(s, mon)
+    end)
+  end
+
+  local function awaitGuestReplacement(s)
+    s:actNext(function()
+      if s.result then return end
+      local idx = table.remove(s.guestReplace, 1)
+      if not idx then
+        awaitGuestReplacement(s)
+        return
+      end
+      local mon = guestParty[idx]
+      if not mon or mon.hp <= 0 then mon = Party.firstHealthy(guestParty) end
+      sendOutGuest(s, mon)
+    end)
+  end
+
   local function resolveSpecTurn(s, hostMsg, guestMsg)
     if hostMsg.kind == "run" or guestMsg.kind == "run" then
       endSpectate(s, "The match ended.")
@@ -734,14 +931,31 @@ function LinkBattle.newSpectator(game, net, opts)
 
     if hostMsg.kind == "switch" then
       local idx = hostMsg.index
-      s:act(function() sendOutHost(s, hostParty[idx]) end)
+      -- SwitchPlayerMon (engine/battle/core.asm:2419-2423)
+      s:act(function()
+        s:sayNextAuto(s:withdrawText(s.player.name), Timing.SWITCH_PLAYER_MON)
+        s:queueRetreatAnim()
+        s:actNext(function() sendOutHost(s, hostParty[idx]) end)
+      end)
     end
     if guestMsg.kind == "switch" then
       local idx = guestMsg.index
-      s:act(function() sendOutGuest(s, guestParty[idx]) end)
+      -- SwitchEnemyMon (engine/battle/trainer_ai.asm:596-599)
+      s:act(function()
+        s:sayNext(s:romText("_AIBattleWithdrawText", "%s with-\ndrew %s!",
+          guestName, s.enemy.name))
+        s:actNext(function() sendOutGuest(s, guestParty[idx]) end)
+      end)
     end
 
     s:act(function()
+      -- the two real players cleared their flinch flags when their move
+      -- menu opened; a spectator has no menu, so it does it here instead,
+      -- at the same point in the turn (see BattleState:clearTurnFlinches).
+      -- Without this a flinch survived into the next turn and ate a move
+      -- that landed in the real match, and the replay -- sharing the RNG
+      -- stream -- was watching a different battle from that point on.
+      s:clearTurnFlinches()
       local hostAction = hostMsg.kind ~= "switch" and hostMsg.kind ~= "run"
                           and decodeWireAction(s, hostMsg, s.player) or nil
       local guestAction = guestMsg.kind ~= "switch" and guestMsg.kind ~= "run"
@@ -786,7 +1000,7 @@ function LinkBattle.newSpectator(game, net, opts)
   self.playerMonFainted = function(s)
     for _, mon in ipairs(hostParty) do
       if mon.hp > 0 then
-        s:act(function() sendOutHost(s, mon) end)
+        if not s.result then awaitHostReplacement(s) end
         return
       end
     end
@@ -798,7 +1012,7 @@ function LinkBattle.newSpectator(game, net, opts)
   self.enemyMonFainted = function(s)
     for _, mon in ipairs(guestParty) do
       if mon.hp > 0 then
-        s:act(function() sendOutGuest(s, mon) end)
+        if not s.result then awaitGuestReplacement(s) end
         return
       end
     end
@@ -808,6 +1022,7 @@ function LinkBattle.newSpectator(game, net, opts)
   end
 
   self.hostMsg, self.guestMsg = nil, nil
+  self.hostReplace, self.guestReplace = {}, {}
   local baseUpdate = self.update
   self.update = function(s, dt)
     net:update()
@@ -821,12 +1036,20 @@ function LinkBattle.newSpectator(game, net, opts)
             s.hostMsg, s.guestMsg = nil, nil
             resolveSpecTurn(s, h, g)
           end
+        elseif inner.type == "replace" then
+          local idx = math.floor(tonumber(inner.index) or 1)
+          if msg.side == "host" then
+            table.insert(s.hostReplace, math.max(1, math.min(#hostParty, idx)))
+          else
+            table.insert(s.guestReplace, math.max(1, math.min(#guestParty, idx)))
+          end
         elseif inner.type == "bye" or inner.type == "forfeit" then
           if not s.result then endSpectate(s, "The match ended.") end
+        elseif inner.type == "hello" or inner.type == "party" then
+          s.pendingTournamentMessages = s.pendingTournamentMessages or {}
+          table.insert(s.pendingTournamentMessages, msg)
         end
-        -- "hello"/"party"/"hash" ride along too (Tournament.lua already
-        -- consumed hello/party before building this battle); none of them
-        -- need any action here
+        -- a spectated "hash" needs no action here
       else
         -- same reasoning as the real-participant loop above: don't lose a
         -- bracket_update/match_start_spectate that arrives mid-match
@@ -837,7 +1060,11 @@ function LinkBattle.newSpectator(game, net, opts)
     if net.closed and not s.linkEnded and not s.result then
       endSpectate(s)
     end
+    -- same as the real-participant loop: every path that skips baseUpdate
+    -- still has to advance the presentational clock, and a spectator sits in
+    -- waitBoth between every single turn
     if s.phase == "messages" and s.afterQueue == "linkNext" then
+      s:tickFx()
       if not s:updateQueue() then
         s.afterQueue = "waitBoth"
         s.phase = "waitBoth"
@@ -845,6 +1072,7 @@ function LinkBattle.newSpectator(game, net, opts)
       return
     end
     if s.phase == "menu" or s.phase == "waitBoth" then
+      s:tickFx()
       return -- frozen between resolved turns; never a real decision here
     end
     baseUpdate(s, dt)
@@ -853,7 +1081,6 @@ function LinkBattle.newSpectator(game, net, opts)
   local baseFinish = self.finish
   self.finish = function(s)
     s.linkEnded = true
-    if game.linkNet == net then game.linkNet = nil end
     baseFinish(s) -- deliberately doesn't touch net: it's the caller's
                   -- tournament connection, still needed after this match
   end

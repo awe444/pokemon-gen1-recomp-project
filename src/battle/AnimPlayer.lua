@@ -104,7 +104,9 @@ local SE_FRAMES = {
   SE_FLASH_MON_PIC = 4, SE_FLASH_ENEMY_MON_PIC = 4,
   SE_TRANSFORM_MON = 4,
   SE_SUBSTITUTE_MON = 3,
-  SE_WAVY_SCREEN = 255,            -- AnimationWavyScreen: ld c, $ff frames
+  -- AnimationWavyScreen: `ld c, $ff` counts outer passes, and the inner
+  -- loop exits twice per displayed frame (animations.asm:1884-1903)
+  SE_WAVY_SCREEN = 128,
 }
 
 -- data/battle_anims/special_effects.asm AnimationIdSpecialEffects:
@@ -348,6 +350,12 @@ local EMITTERS = {
   SE_PETALS_FALLING = function() return fallingObjectSteps(20, PETAL_TILE, "e4") end,
 }
 
+-- home/copy2.asm:62 CopyVideoData -- 8 tiles a frame plus the tail frame
+local function tilesetLoadFrames(data, ts)
+  local sheet = data and data.tilesheets and data.tilesheets[ts or 0]
+  return math.floor((sheet and sheet.tiles or 79) / 8) + 1
+end
+
 -- One OAM entry for tile `t` of a frame block anchored at base coord `bc`,
 -- with the subanimation transform applied (DrawFrameBlock).
 local function placeTile(transform, bc, t, tileset)
@@ -392,6 +400,12 @@ function AnimPlayer:start(moveId, attackerIsPlayer, opts)
   self.steps, self.events = {}, {}
   self.stepIndex, self.stepLeft = 1, 0
   self.elapsed, self.eventCursor = 0, 1
+
+  -- animations.asm:452-473 (#1881)
+  if not attackerIsPlayer then
+    if moveId == "AMNESIA" then moveId = "CONF_ANIM"
+    elseif moveId == "REST" then moveId = "SLP_ANIM" end
+  end
 
   local anim = self.data and self.data.moveAnims and self.data.moveAnims[moveId]
   if not anim then
@@ -456,6 +470,11 @@ function AnimPlayer:start(moveId, attackerIsPlayer, opts)
   local obp0Flip = false
 
   for _, row in ipairs(anim.seq) do
+    -- engine/battle/animations.asm:252 LoadMoveAnimationTiles, before the
+    -- row's sound and its first frame block (#1653)
+    if not row.effect then
+      emit(tilesetLoadFrames(self.data, row.tileset))
+    end
     -- PlayAnimation/PlaySubanimation: each row's sound byte is a move id
     -- whose MoveSoundTable entry (sfx + pitch/tempo modifiers) plays as
     -- the row starts (GetMoveSound)
@@ -491,15 +510,10 @@ function AnimPlayer:start(moveId, attackerIsPlayer, opts)
         local transform = resolveTransform(sub.type, attackerIsPlayer)
         local first, last, dir = 1, #sub.blocks, 1
         if transform == "REVERSE" then first, last, dir = last, first, -1 end
-        -- DoBallShakeSpecialEffects: each ball shake opens with SFX_TINK
-        -- and a 40-frame pause, then rewinds the same subanimation; the
-        -- mode-4 frame blocks persist, so the resting ball stays visible
-        -- through the pauses between wobbles
+        -- DoBallShakeSpecialEffects: animations.asm:739-747, :623-627
+        local pendingTink = false
         for _ = 1, (opts and opts.shakes) or 1 do
-          if opts and opts.shakes then
-            events[#events + 1] = { effect = "SFX_TINK", frame = frame }
-            emit(40)
-          end
+          pendingTink = opts and opts.shakes ~= nil
           local dest = 1   -- PlaySubanimation resets the OAM cursor per row
           local nblocks = math.abs(last - first) + 1
           local played = 0
@@ -557,6 +571,11 @@ function AnimPlayer:start(moveId, attackerIsPlayer, opts)
               -- DoSpecialEffectByAnimationId runs after every frame
               -- block with wSubAnimCounter = blocks remaining
               played = played + 1
+              if pendingTink then
+                pendingTink = false
+                events[#events + 1] = { effect = "SFX_TINK", frame = frame }
+                emit(40)
+              end
               if ballFlicker then obp0Flip = not obp0Flip end
               if idFx then
                 local counter = nblocks - played + 1
@@ -681,7 +700,16 @@ end
 -- BattleState keeps drawing it via drawSprites.
 function AnimPlayer:finalSprites()
   local last = self.steps[#self.steps]
-  return last and last.sprites or nil
+  if not last then return nil end
+  -- engine/battle/animations.asm:258-260
+  local out = {}
+  for i, s in ipairs(last.sprites) do
+    local c = {}
+    for k, v in pairs(s) do c[k] = v end
+    if c.obp == "f0" or c.obp == "f0x" then c.obp = "e4" end
+    out[i] = c
+  end
+  return out
 end
 
 -- two colorFn results (three 0-1 RGB triples) resolve the same palette?

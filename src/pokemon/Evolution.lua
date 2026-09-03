@@ -15,8 +15,12 @@ local Screens = require("src.ui.Screens")
 local Stats = require("src.pokemon.Stats")
 local TextBox = require("src.render.TextBox")
 local Strings = require("src.core.Strings")
+local romText = require("src.core.RomText")
 
 local Evolution = {}
+
+-- engine/pokemon/evos_moves.asm:122-123 (ld c, 50 / call DelayFrames)
+local EVOLVING_TEXT_FRAMES = 50
 
 Evolution.METHODS = {
   LEVEL = {
@@ -139,8 +143,12 @@ function Evolution.learnEvolutionMoves(game, mon, onDone)
     if #mon.moves < 4 then
       table.insert(mon.moves, { id = moveId, pp = mdef.pp })
       Runtime.emit("pokemon.move_learned", { mon = mon, moveId = moveId })
+      -- LearnedMove1Text: text_far, sound_get_item_1, text_promptbutton
+      -- (learn_move.asm), so the jingle rides the box
       game.stack:push(TextBox.new(game,
-        Strings("%s learned\n%s!", name, mdef.name), nextStep))
+        romText(game.data, "_LearnedMove1Text",
+          "%s learned\n%s!", name, mdef.name), nextStep,
+        TextBox.soundOpts(game, "Get_Item1")))
     else
       -- LearnMoveFromLevelUp with a full moveset: the forget UI
       Screens.push(game, "MoveLearnMenu", mon, moveId, nextStep)
@@ -152,23 +160,50 @@ end
 -- Play the evolution movie (flashing forms), then apply + text.
 -- Headless (no real graphics) falls back to the plain text flow.
 function Evolution.evolve(game, mon, newSpecies, onDone, via)
+  local oldName = mon.nickname or game.data.pokemon[mon.species].name
+  -- IsEvolvingText, DelayFrames 50; ClearScreenArea then wipes rows 0-11
+  -- ONLY, so the box rides through EvolveMon (evos_moves.asm:120-134)
+  local isEvolving = romText(game.data, "_IsEvolvingText",
+    "What?\n%s is\nevolving!", oldName)
   if love.image and love.image.newImageData then
-    -- forward `via` so EvolutionState can keep trade evolutions
-    -- non-cancelable (LINK_STATE_TRADING) while others accept B (#213)
-    Screens.push(game, "EvolutionState", mon, newSpecies, onDone, via)
+    local intro
+    intro = TextBox.new(game, isEvolving, nil, { stay = {
+      onShown = function()
+        -- DelayFrames 50 with the box and the old screen still up
+        -- (evos_moves.asm:122-123)
+        local hold = { t = 0 }
+        hold.update = function()
+          hold.t = hold.t + 1
+          if hold.t < EVOLVING_TEXT_FRAMES then return end
+          game.stack:pop() -- this hold
+          -- forward `via` so trade evolutions stay non-cancelable while
+          -- others accept B (evos_moves.asm:72-75) (#213)
+          Screens.push(game, "EvolutionState", mon, newSpecies, function()
+            -- the result/cancel box owns the intro box's pop (#1596)
+            if game.stack:top() == intro then game.stack:pop() end
+            if onDone then onDone() end
+          end, via)
+        end
+        hold.draw = function() end
+        game.stack:push(hold)
+      end,
+    } })
+    game.stack:push(intro)
     return
   end
   Music.play(game.data, Music.special(game.data, "evolution"))
-  local oldName = mon.nickname or game.data.pokemon[mon.species].name
   Evolution.apply(game, mon, newSpecies, via)
-  local msg = Strings("What?\n%s is\nevolving!\fCongratulations!\nYour %s\nevolved into\n%s!",
-                      oldName, oldName, game.data.pokemon[newSpecies].name)
+  -- EvolvedText then IntoText in the same box (evos_moves.asm:136-150)
+  local msg = isEvolving .. "\f"
+    .. romText(game.data, "_EvolvedText", "%s evolved", oldName)
+    .. romText(game.data, "_IntoText", "\ninto %s!",
+         game.data.pokemon[newSpecies].name)
   game.stack:push(TextBox.new(game, msg, function()
     Music.restoreMap(game.data)
     -- re-run the evolved species' level-up learn check before onDone
     -- (evos_moves.asm EvolveMon -> learn_move.asm LearnMoveFromLevelUp, #12)
     Evolution.learnEvolutionMoves(game, mon, onDone)
-  end))
+  end, TextBox.soundOpts(game, "Get_Item2")))
 end
 
 -- Entry point for mods whose methods fire outside the vanilla moments
@@ -187,7 +222,7 @@ end
 
 -- After-battle hook: evolve mons that leveled this battle and still
 -- qualify (queued one at a time, party order).  Gen1 EvolveAfterBattle
--- only considers mons that gained a level during the fight — a B-cancel
+-- only considers mons that gained a level during the fight -- a B-cancel
 -- means "not this time", and the next offer waits for the next level-up
 -- (or Rare Candy / stone, which call Evolution.evolve directly).
 -- leveledUp is a set of party mon tables; nil/empty yields no evolutions.

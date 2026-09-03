@@ -18,7 +18,8 @@ local function samePath(path) return path end
 -- side: "front" | "back"
 -- opts.mon: the live mon when available (per-instance skins)
 -- opts.kind: "battle" | "summary" | "dex" | "evolution" | "hof" | "trade"
---            | "title" | "oak" | "credits" (informational for wrappers)
+--            | "title" | "oak" | "credits" | "overworld" (informational
+--            for wrappers)
 -- Returns path, trueColor.
 function Sprites.path(data, species, side, opts)
   opts = opts or {}
@@ -45,24 +46,52 @@ end
 -- opts.kind: "battle" | "intro" | "trainer_card" | "hof"
 -- opts.demo: the catch tutorial, where the old man fights in the player's
 --            place and stands in for the back pic
+-- opts.oakDemo: the Yellow variant of that demo (BATTLE_TYPE_PIKACHU), where
+--            PROF.OAK fights in the player's place behind his own back pic
 -- opts.battle: the live battle, for kind == "battle"
 -- Returns path, trueColor.
 function Sprites.playerPath(data, side, opts)
   opts = opts or {}
   side = side == "back" and "back" or "front"
   -- one key per pic, so a conversion can replace the back and inherit the
-  -- rest; fieldValue folds data.field over FieldDefaults per key
+  -- rest; fieldValue folds data.field over FieldDefaults per key.  The two
+  -- demo keys mirror LoadPlayerBackPic's wBattleType branch (#557).
   local key = side == "front" and "front"
+              or (opts.oakDemo and "oakBack")
               or (opts.demo and "demoBack" or "back")
   local path = FieldDefaults.fieldValue(data, "playerPics", key)
+  -- ProfOakPicBack is a Yellow-only rip, so a cache imported before it
+  -- existed has no file there; fall back to the old man rather than hand a
+  -- missing path to getImage (#557)
+  if key == "oakBack" and path
+     and not require("src.render.Assets").exists(path) then
+    path = FieldDefaults.fieldValue(data, "playerPics", "demoBack")
+  end
   local ctx = {
     side = side,
     kind = opts.kind or "battle",
     demo = opts.demo and true or false,
+    oakDemo = opts.oakDemo and true or false,
     battle = opts.battle,
     trueColor = false,
     data = data,
   }
+  return Sprites.playerPic(path, ctx)
+end
+
+-- Raise player.sprite over an ALREADY-resolved path.  Gold's trainer art is
+-- not in field.playerPics -- its back pic comes off gen2MenuGfx.battleHud, its
+-- card and Hall of Fame off their own tables -- so its call sites resolve
+-- their own path and hand it here, which keeps one hook name, one payload and
+-- one mod source across both generations (src/ui/gen2/BattleState.lua).
+-- ctx wants { side, kind, demo, oakDemo, battle, trueColor, data }.
+-- Returns path, trueColor.
+function Sprites.playerPic(path, ctx)
+  ctx = ctx or {}
+  ctx.side = ctx.side == "back" and "back" or "front"
+  ctx.kind = ctx.kind or "battle"
+  ctx.demo = ctx.demo and true or false
+  ctx.oakDemo = ctx.oakDemo and true or false
   if path and Runtime.wantsHook("player.sprite") then
     local hooked = Runtime.call("player.sprite", samePath, path, ctx)
     if type(hooked) == "string" and hooked ~= "" then path = hooked end
