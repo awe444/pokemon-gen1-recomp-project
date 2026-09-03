@@ -16,15 +16,31 @@
 -- the MINIMUM-scored move is chosen, ties broken uniformly among the
 -- tied minima (core.asm:2971-3002).  A non-minimal move is never
 -- selectable.  Respects Disable (and PP only when the ruleset depletes
--- enemy PP — Gen 1 AI never reads wEnemyMonPP).
+-- enemy PP -- Gen 1 AI never reads wEnemyMonPP).
 
 local TypeChart = require("src.battle.TypeChart")
 local Strings = require("src.core.Strings")
+local romText = require("src.core.RomText")
 
 local TrainerAI = {}
 
+-- pokered's <USER>/<TARGET> text macros print "Enemy " before the
+-- enemy mon's nickname (home/text.asm PlaceMoveUsersName)
+local function displayName(b)
+  return b.isPlayer and b.name or Strings("Enemy %s", b.name)  -- #779
+end
+
 local HEAL_AMOUNT = { POTION = 20, SUPER_POTION = 50, HYPER_POTION = 200 }
 local X_STAT = { X_ATTACK = "attack", X_DEFEND = "defense", X_SPEED = "speed" }
+
+-- Strings.source, not Strings: harvested at require time so the catalog
+-- generator can see the literal, same pattern as MoveEffects.lua's
+-- STAT_LABEL (#811) -- Strings(stat:upper()) alone is a dynamic argument
+-- the harvester can't discover.
+local STAT_LABEL = {
+  attack = Strings.source("ATTACK"), defense = Strings.source("DEFENSE"),
+  speed = Strings.source("SPEED"),
+}
 
 -- The trainer's ai_classes record from the merged registry; the direct
 -- require covers battles built without a loader.  A trainer record's
@@ -38,9 +54,7 @@ function TrainerAI.classFor(battle)
   return require("data.scripts.ai_classes")[id]
 end
 
--- Item use / switching per trainer class (engine/battle/trainer_ai.asm
--- via the ai_classes registry).  Runs before move choice each enemy
--- turn; returns an action { special = "aiItem"/"aiSwitch", ... } or nil.
+-- engine/battle/trainer_ai.asm:290-320, engine/battle/core.asm:416,454
 -- battle.aiUses is initialized per enemy Pokémon (wAICount).
 function TrainerAI.classAction(battle)
   if battle.kind ~= "trainer" or not battle.trainer then return nil end
@@ -95,12 +109,16 @@ function TrainerAI.switchAction(battle)
   return { special = "aiSwitch", index = alive[1] }
 end
 
--- Apply an aiItem action to the enemy battler; returns messages.
+-- Apply an aiItem action to the enemy battler; returns messages, already
+-- final: the item line prints the raw nickname (AIPrintItemUseText has no
+-- "Enemy " prefix in pokered), the stat lines carry it via displayName, so
+-- the caller must not run these through prefixEnemy.
 function TrainerAI.useItem(battle, item)
   local enemy = battle.enemy
   local trainerName = battle.trainer.name
   local itemName = battle.data.items[item] and battle.data.items[item].name or item
-  local msgs = { Strings("%s\nused %s!", trainerName, itemName) }
+  local msgs = { romText(battle.data, "_AIBattleUseItemText",
+    "%s\nused %s!", trainerName, itemName, enemy.name) }
   if item == "FULL_HEAL" then
     enemy.mon.status = nil
     enemy.toxicCounter = nil
@@ -113,10 +131,10 @@ function TrainerAI.useItem(battle, item)
   elseif X_STAT[item] then
     local stat = X_STAT[item]
     enemy.stages[stat] = math.min(6, (enemy.stages[stat] or 0) + 1)
-    table.insert(msgs, Strings("%s's\n%s rose!", enemy.name, stat:upper()))
+    table.insert(msgs, Strings("%s's\n%s rose!", displayName(enemy), Strings(STAT_LABEL[stat])))
   elseif item == "GUARD_SPEC" then
     enemy.mist = true
-    table.insert(msgs, Strings("%s's\nprotected against\nstat changes!", enemy.name))
+    table.insert(msgs, Strings("%s's\nprotected against\nstat changes!", displayName(enemy)))
   end
   return msgs
 end

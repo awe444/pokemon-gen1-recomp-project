@@ -7,14 +7,18 @@ local M = {}
 
 local function text(game) return game.data.text end
 
-local function push(game, s, done)
+local function push(game, s, done, opts)
   local TextBox = require("src.render.TextBox")
-  game.stack:push(TextBox.new(game, s, done))
+  game.stack:push(TextBox.new(game, s, done, opts))
 end
 
+-- PrintText on a text_end string returns with the box still drawn and
+-- YesNoChoice then draws the menu above it (InitYesNoTextBoxParameters,
+-- engine/menus/text_box.asm); no A press clears the question first.  Ride
+-- TextBox's opts.choice, the same as Commands.ask (#854).
 local function ask(game, s, cb)
-  local ChoiceBox = require("src.ui.ChoiceBox")
-  push(game, s, function() game.stack:push(ChoiceBox.new(game, cb)) end)
+  local TextBox = require("src.render.TextBox")
+  game.stack:push(TextBox.new(game, s, nil, { choice = cb }))
 end
 
 -- -------------------------------------------------------------------
@@ -118,6 +122,7 @@ local MANSION_HOLES = {
 M.POKEMON_MANSION_3F.onStep = function(game, ow, x, y)
   for _, h in ipairs(MANSION_HOLES) do
     if x == h[1] and y == h[2] then
+      require("src.core.Sound").play(game.data, "Faint_Fall")
       ow:startWarpTo(h[3], h[4], h[5], ow.player.facing)
       return true
     end
@@ -173,7 +178,46 @@ local function syncGymGatesAfterBattle(game, ow)
   applyGymGates(game, ow)
 end
 
+-- Yellow's quiz-first rule (scripts/CinnabarGym.asm SuperNerd2..7): a
+-- gate guardian refuses to battle until his quiz was attempted -- a
+-- wrong answer sics him on you (the onInteract path below), a right one
+-- opens his gate; walking up and talking first just gets the room's
+-- CinnabarGymText_N lecture (Func_f2150's pointer table).
+local function yellowQuizTalk(machineIndex)
+  return function(game, ow, npc, done)
+    local yellow = require("src.core.GameVersion").isYellow()
+    local defeated = ow:trainerDefeated(npc)
+    local gateOpen = game.save.flags[gymGateFlag(machineIndex)]
+    if yellow and not defeated and not gateOpen then
+      local TextBox = require("src.render.TextBox")
+      local t = game.data.text
+      game.stack:push(TextBox.new(game,
+        t["_CinnabarGymText_" .. machineIndex]
+        or "You have to take\nthe quiz first!", done))
+      return
+    end
+    -- gate open (or Red/Blue): the ordinary trainer engagement /
+    -- after-battle line, mirroring talkTo's generic trainer branch
+    npc:facePlayer(ow.player)
+    if not defeated then
+      ow:engageTrainer(npc, done)
+      return
+    end
+    local header = game.data:trainerHeader(ow.map.def.label, npc.def.index)
+    local after = header and header.after and game.data.text[header.after]
+    local TextBox = require("src.render.TextBox")
+    game.stack:push(TextBox.new(game, after or "...", done))
+  end
+end
+
 M.CINNABAR_GYM = {
+  talk = (function()
+    local talk = {}
+    for i = 1, 6 do
+      talk["TEXT_CINNABARGYM_SUPER_NERD" .. (i + 1)] = yellowQuizTalk(i)
+    end
+    return talk
+  end)(),
   onEnter = applyGymGates,
   onVictory = syncGymGatesAfterBattle,
   onInteract = function(game, ow, fx, fy)
@@ -192,7 +236,6 @@ M.CINNABAR_GYM = {
           if yes == machine.yes then
             -- CinnabarGymQuizCorrectText: item jingle, then the gate
             -- slides open (SFX_GO_INSIDE) if it was still locked
-            Sound.play(game.data, "Get_Item1")
             push(game, t._CinnabarGymQuizCorrectText
               or "You're absolutely\ncorrect!\fGo on through!", function()
               if not game.save.flags[gymGateFlag(index)] then
@@ -200,7 +243,9 @@ M.CINNABAR_GYM = {
                 Sound.play(game.data, "Go_Inside")
               end
               applyGymGates(game, ow)
-            end)
+            end, { preSound = function()
+              return Sound.play(game.data, "Get_Item1")
+            end })
             return
           end
           Sound.play(game.data, "Denied")

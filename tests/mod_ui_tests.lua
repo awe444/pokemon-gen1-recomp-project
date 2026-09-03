@@ -154,7 +154,7 @@ local function startGame()
   }
 end
 local VANILLA_START = { "POKéDEX", "POKéMON", "ITEM", "RED", "SAVE",
-                        "OPTION", "LINK", "QUIT" }
+                        "OPTION", "QUIT" }
 local menu = StartMenu.new(startGame())
 check(#menu.items == #VANILLA_START, "vanilla start menu row count")
 for i, label in ipairs(VANILLA_START) do
@@ -281,10 +281,20 @@ local function optGame()
   }
 end
 local om = OptionsMenu.new(optGame())
-local WANT_IDS = { "textSpeed", "animations", "battleStyle", "ruleset",
-                   "musicVol", "sfxVol", "musicFilter", "colors", "tilt",
-                   "gbcfx", "zoom", "voidFill", "videoMode", "fpsCap",
-                   "speed", "mods", "controls" }
+local WANT_IDS = { "textSpeed", "animations", "battleStyle", "battleLayout",
+                   "battleFit", "battleHud", "battleBg", "uiLayout",
+                   "ruleset", "musicVol", "sfxVol", "musicFilter",
+                   "performance", "colors",
+                   "tilt", "uiLetterbox", "shaderfx", "shaderfx2", "zoom", "voidFill",
+                   "videoMode", "faithfulRes", "screenPos", "fpsCap", "vsync", "logicClock",
+                   "speedOverworld", "speedBattle", "speedMenu",
+                   "mods", "controls", "dateFormat", "timeFormat" }
+local function orow(menu, id)
+  for _, row in ipairs(menu.rows) do
+    if row.id == id then return row end
+  end
+  error("no options row '" .. id .. "'")
+end
 check(#om.rows == #WANT_IDS, "vanilla options row count (plus MODS/CONTROLS)")
 for i, id in ipairs(WANT_IDS) do
   check(om.rows[i].id == id, "options row order: " .. id)
@@ -292,11 +302,12 @@ end
 
 -- ruleset row cycles the sorted non-hidden registry ids showing name
 om.game.save.options.ruleset = "gen1_faithful"
-check(om.rows[4].value(om.game) == "GEN 1", "ruleset row shows record.name")
-om.rows[4].step(om.game, 1)
+check(orow(om, "ruleset").value(om.game) == "GEN 1",
+  "ruleset row shows record.name")
+orow(om, "ruleset").step(om.game, 1)
 check(om.game.save.options.ruleset == "modern_clean",
   "ruleset row cycles sorted registry ids")
-om.rows[4].step(om.game, 1)
+orow(om, "ruleset").step(om.game, 1)
 check(om.game.save.options.ruleset == "gen1_faithful",
   "hidden rulesets are excluded from the cycle")
 
@@ -309,41 +320,123 @@ om.rows[2].step(om.game, 1)
 check(om.game.save.options.animations == false, "animations toggles off")
 om.rows[3].step(om.game, 1)
 check(om.game.save.options.battleStyle == "set", "battle style flips to SET")
-om.rows[5].step(om.game, -1)
+check(om.rows[4].value(om.game) == "OG", "battle layout starts on the OG screen")
+om.rows[4].step(om.game, 1)
+check(om.game.save.options.battleLayout == "wide", "battle layout flips to WIDE")
+check(om.rows[4].value(om.game) == "WIDE", "the WIDE layout renders its label")
+om.rows[4].step(om.game, 1)
+check(om.game.save.options.battleLayout == "og", "battle layout flips back")
+orow(om, "musicVol").step(om.game, -1)
 check(om.game.save.options.musicVol == 6, "music volume steps down")
-for _ = 1, 10 do om.rows[5].step(om.game, -1) end
+for _ = 1, 10 do orow(om, "musicVol").step(om.game, -1) end
 check(om.game.save.options.musicVol == 0, "music volume clamps at 0")
 
--- ZOOM / VOID FILL rows
+-- ZOOM / VOID FILL rows (looked up by id; WANT_IDS above pins the order,
+-- with SHADER FX / SHADER FX 2 right after TILT now that GBCFX.lua and
+-- its row are gone)
 local Zoom = require("src.render.Zoom")
 local TileRenderer = require("src.render.TileRenderer")
 om.game.save.options.zoom = 0
 Zoom.offset = 0
-check(om.rows[11].value(om.game) == "FIT", "ZOOM row shows FIT at offset 0")
-om.rows[11].step(om.game, 1)
+check(orow(om, "zoom").value(om.game) == "FIT",
+  "ZOOM row shows FIT at offset 0")
+orow(om, "zoom").step(om.game, 1)
 check(om.game.save.options.zoom == 1 and Zoom.offset == 1,
   "ZOOM row steps to IN1")
-om.rows[12].step(om.game, 1)
+orow(om, "zoom").step(om.game, -1)
+check(om.game.save.options.zoom == 0, "ZOOM row steps back to FIT")
+orow(om, "zoom").step(om.game, -1)
+check(om.game.save.options.zoom == -1 and Zoom.offset == -1,
+  "ZOOM row steps to OUT1")
+check(orow(om, "zoom").value(om.game) == "OUT1",
+  "ZOOM row shows OUT1")
+orow(om, "zoom").step(om.game, 1)
+check(om.game.save.options.zoom == 0, "ZOOM row steps back to FIT from OUT")
+orow(om, "voidFill").step(om.game, 1)
 check(om.game.save.options.voidFill == "water"
       and TileRenderer.voidFill == "water",
   "VOID FILL row cycles TREES → WATER")
-om.rows[12].step(om.game, 1)
+orow(om, "voidFill").step(om.game, 1)
 check(om.game.save.options.voidFill == "black", "VOID FILL steps to BLACK")
-om.rows[12].step(om.game, 1)
+orow(om, "voidFill").step(om.game, 1)
 check(om.game.save.options.voidFill == "trees", "VOID FILL wraps to TREES")
+
+-- the SHADER FX row now pushes a real ShaderFXScreen list instead of
+-- cycling in place. With no presets under ShaderFX.presetDir() (nothing
+-- is dropped in for this stub love.filesystem), the pushed screen must
+-- show OFF plus the permanent DOWNLOAD SHADERS row and stay a safe
+-- no-op rather than crash. SHADER FX 2 (the dual-shader secondary slot)
+-- mirrors it one row down, opening the same shared screen on
+-- "secondary" instead.
+local ShaderFX = require("src.render.ShaderFX")
+local sfx = orow(om, "shaderfx")
+check(sfx.value(om.game) == "OFF", "SHADER FX shows OFF with no presets")
+check(sfx.step == nil, "SHADER FX row has no step() any more")
+sfx.activate(om.game)
+local sfxScreen = om.game.stack:top()
+check(sfxScreen and sfxScreen.title == "SHADER FX",
+  "SHADER FX row.activate() pushes a ShaderFXScreen")
+check(#sfxScreen.items == 2 and sfxScreen.items[1].label == "OFF"
+  and sfxScreen.items[2].download == true,
+  "ShaderFXScreen shows OFF + DOWNLOAD SHADERS with zero presets found")
+sfxScreen.onChoose(sfxScreen.items[1])
+check(ShaderFX.active("main") == false, "choosing OFF on an empty list stays a safe no-op")
+check(om.game.stack:top() == nil, "ShaderFXScreen pops itself after onChoose")
+
+local sfx2 = orow(om, "shaderfx2")
+check(sfx2.value(om.game) == "OFF", "SHADER FX 2 shows OFF with no presets")
+sfx2.activate(om.game)
+local sfx2Screen = om.game.stack:top()
+check(sfx2Screen and sfx2Screen.title == "SHADER FX 2",
+  "SHADER FX 2 row.activate() pushes the shared ShaderFXScreen on the secondary slot")
+sfx2Screen.onChoose(sfx2Screen.items[1])
+check(ShaderFX.active("secondary") == false, "choosing OFF on the secondary slot is a safe no-op")
+check(ShaderFX.active() == false, "neither slot active means ShaderFX.active() is false")
+check(om.game.stack:top() == nil, "the secondary ShaderFXScreen pops itself after onChoose")
 
 -- the MAX FPS row cycles the render-cap steps and shows the value plain
 om.game.save.options.fpsCap = nil
-check(om.rows[14].value(om.game) == "60",
+check(orow(om, "fpsCap").value(om.game) == "60",
   "MAX FPS row defaults to 60 with no saved cap")
-om.rows[14].step(om.game, 1)
+orow(om, "fpsCap").step(om.game, 1)
 check(om.game.save.options.fpsCap == 75, "MAX FPS steps up from 60 to 75")
-check(om.rows[14].value(om.game) == "75", "the MAX FPS row renders the cap")
+check(orow(om, "fpsCap").value(om.game) == "75",
+  "the MAX FPS row renders the cap")
 om.game.save.options.fpsCap = 160
-om.rows[14].step(om.game, 1)
-check(om.game.save.options.fpsCap == 30, "MAX FPS wraps past the ceiling to 30")
-om.rows[14].step(om.game, -1)
-check(om.game.save.options.fpsCap == 160, "MAX FPS wraps back down to the ceiling")
+orow(om, "fpsCap").step(om.game, 1)
+check(om.game.save.options.fpsCap == FrameCap.DISPLAY,
+  "MAX FPS steps past the ceiling to DISPLAY")
+check(orow(om, "fpsCap").value(om.game) == "DISPLAY",
+  "the uncapped stop renders as DISPLAY")
+orow(om, "fpsCap").step(om.game, 1)
+check(om.game.save.options.fpsCap == 30, "and wraps from there to the floor")
+orow(om, "fpsCap").step(om.game, -1)
+check(om.game.save.options.fpsCap == FrameCap.DISPLAY,
+  "MAX FPS wraps back down to DISPLAY")
+
+om.game.save.options.vsync = nil
+check(orow(om, "vsync").value(om.game) == "ON",
+  "VSYNC row reads the boot mode with no saved key")
+orow(om, "vsync").step(om.game, 1)
+check(om.game.save.options.vsync == "off", "VSYNC steps ON to OFF")
+check(orow(om, "vsync").value(om.game) == "OFF", "and renders it")
+orow(om, "vsync").step(om.game, 1)
+check(om.game.save.options.vsync == "on", "then OFF wraps to ON")
+
+do
+  local PS = require("src.core.PresentSync")
+  PS.reset()
+  require("src.core.PresentProbe")._testSetState({ needsSoftwareCap = true })
+  check(orow(om, "vsync").value(om.game) == "UNAVAILABLE",
+    "VSYNC shows UNAVAILABLE when present sync fell back to FrameCap")
+  check(orow(om, "vsync").step(om.game, 1) == true,
+    "but stepping toward OFF is still allowed")
+  check(om.game.save.options.vsync == "off",
+    "and lands on OFF instead of staying stuck on")
+  check(orow(om, "vsync").value(om.game) == "OFF",
+    "so the row reads OFF once sync is disabled")
+  PS.reset()
+end
 
 -- ------- FrameCap normalize / cycle (issue #88)
 check(FrameCap.normalize(nil) == 60, "FrameCap defaults nil to 60")
@@ -351,7 +444,9 @@ check(FrameCap.normalize("junk") == 60, "FrameCap defaults garbage to 60")
 check(FrameCap.normalize(60) == 60, "FrameCap keeps an exact step")
 check(FrameCap.normalize(58) == 60, "FrameCap snaps 58 to the nearest step 60")
 check(FrameCap.normalize(72) == 75, "FrameCap snaps 72 to the nearest step 75")
-check(FrameCap.normalize(0) == 30, "FrameCap clamps below the floor to 30")
+check(FrameCap.normalize(1) == 30, "FrameCap clamps below the floor to 30")
+check(FrameCap.normalize(0) == FrameCap.DISPLAY,
+  "and a zero cap is DISPLAY, not the floor (issue #1910)")
 check(FrameCap.normalize(9999) == 160, "FrameCap clamps above the ceiling to 160")
 check(FrameCap.normalize(30) == 30 and FrameCap.normalize(160) == 160,
   "FrameCap keeps the exact floor and ceiling")
@@ -359,8 +454,12 @@ check(FrameCap.label(nil) == "60" and FrameCap.label(144) == "144",
   "FrameCap.label renders the normalized cap as plain text")
 check(FrameCap.cycle(60, 1) == 75, "FrameCap cycles 60 up to 75")
 check(FrameCap.cycle(60, -1) == 50, "FrameCap cycles 60 down to 50")
-check(FrameCap.cycle(160, 1) == 30, "FrameCap cycle wraps the ceiling to the floor")
-check(FrameCap.cycle(30, -1) == 160, "FrameCap cycle wraps the floor to the ceiling")
+check(FrameCap.cycle(160, 1) == FrameCap.DISPLAY,
+  "FrameCap cycle steps the ceiling to DISPLAY")
+check(FrameCap.cycle(FrameCap.DISPLAY, 1) == 30,
+  "and wraps DISPLAY to the floor")
+check(FrameCap.cycle(30, -1) == FrameCap.DISPLAY,
+  "FrameCap cycle wraps the floor back to DISPLAY")
 check(FrameCap.cycle(nil, 1) == 75,
   "FrameCap cycle normalizes a nil cap (60) before stepping")
 -- apply drives the live value the run loop paces to; never touches love.timer
@@ -372,7 +471,7 @@ check(FrameCap.current == 60, "FrameCap.applyOptions defaults a missing key to 6
 -- the MODS row is the manager's discoverable home
 local mgGame = optGame()
 om = OptionsMenu.new(mgGame)
-om.rows[16].activate(mgGame)
+orow(om, "mods").activate(mgGame)
 check(getmetatable(mgGame.stack:top()) == ManagerState,
   "the MODS row opens the manager")
 check(mgGame.stack:top().screenId == "ManagerState",
@@ -382,20 +481,41 @@ check(mgGame.stack:top().screenId == "ManagerState",
 local BindingsMenu = require("src.ui.BindingsMenu")
 local cbGame = optGame()
 om = OptionsMenu.new(cbGame)
-om.rows[17].activate(cbGame)
+orow(om, "controls").activate(cbGame)
 local bm = cbGame.stack:top()
 check(getmetatable(bm) == BindingsMenu,
   "the CONTROLS row opens the rebind list")
 check(bm.screenId == "BindingsMenu",
   "the pushed rebind screen carries its screen id")
-check(#bm.items == 8, "one row per logical button")
-check(bm.items[1].label == "UP" and bm.items[1].right == "UP"
-  and bm.items[5].label == "A" and bm.items[5].right == "Z"
-  and bm.items[7].label == "START" and bm.items[7].right == "ESCAPE"
+check(#bm.items == 10,
+  "one row per logical button, plus the two pad-action rows (#1922)")
+check(bm.items[1].label == "UP" and bm.items[1].right == "UP/D-UP"
+  and bm.items[5].label == "A" and bm.items[5].right == "Z/A"
+  and bm.items[7].label == "START" and bm.items[7].right == "ESC/START"
   and bm.items[8].label == "SELECT" and bm.items[8].right == "TAB/BACK",
-  "with no rebind the rows mirror the fixed map")
+  "with no rebind the rows mirror the fixed map, key and pad both (#589)")
+check(bm.items[9].label == "SPEED -" and bm.items[9].right == "LB"
+  and bm.items[10].label == "SPEED +" and bm.items[10].right == "RB",
+  "and the GAME SPEED shortcuts show the shoulders they sit on (#1922)")
 check(cbGame.save.options.bindings == nil,
   "opening the screen alone writes nothing")
+
+-- shared date/time presentation stays in options.lua and is available to
+-- engine UI and mods without becoming checkpoint progress
+om.game.save.options.dateFormat = "device"
+om.game.save.options.timeFormat = "device"
+check(orow(om, "dateFormat").value(om.game) == "DEVICE",
+  "DATE FORMAT defaults to device locale")
+orow(om, "dateFormat").step(om.game, 1)
+check(om.game.save.options.dateFormat == "dmy"
+      and orow(om, "dateFormat").value(om.game) == "DD-MM-YYYY",
+  "DATE FORMAT exposes deterministic DMY override")
+check(orow(om, "timeFormat").value(om.game) == "DEVICE",
+  "TIME FORMAT defaults to device locale")
+orow(om, "timeFormat").step(om.game, 1)
+check(om.game.save.options.timeFormat == "24h"
+      and orow(om, "timeFormat").value(om.game) == "24 HOUR",
+  "TIME FORMAT exposes deterministic 24-hour override")
 check(bm.onKeyPressed == nil and bm.onGamepadPressed == nil,
   "no raw-input claim until a capture is armed")
 press(bm, "a")
@@ -404,18 +524,20 @@ check(bm.capture == bm.items[1] and bm.onKeyPressed ~= nil,
 local wroteOptions = false
 function cbGame:writeOptions() wroteOptions = true end
 bm:onKeyPressed("j")
+bm:onKeyReleased("j") -- a capture commits on the press's release (#589)
 check(cbGame.save.options.bindings.up.key == "j",
   "a captured key lands in options.bindings")
-check(bm.items[1].right == "J", "the row shows the new key")
+check(bm.items[1].right == "J/D-UP", "the row shows the new key")
 check(wroteOptions, "a rebind persists through writeOptions")
 check(bm.capture == nil and bm.onKeyPressed == nil
   and bm.onGamepadPressed == nil, "the capture disarms after one input")
 bm.index = 5
 press(bm, "a")
 bm:onGamepadPressed("y")
+bm:onGamepadReleased("y")
 check(cbGame.save.options.bindings.a.pad == "y",
   "a captured pad button lands beside the key slot")
-check(bm.items[5].right == "Z", "a pad rebind keeps the key column")
+check(bm.items[5].right == "Z/Y", "a pad rebind keeps the key column")
 press(bm, "b")
 check(#cbGame.stack.states == 0, "B closes the rebind screen")
 
@@ -425,9 +547,12 @@ local Input = require("src.core.Input")
 local gpGame = { stack = newStack() }
 local sawPad
 gpGame.stack:push({ onGamepadPressed = function(_, b) sawPad = b end })
+-- gamepadpressed reads Input:isDown("select") for the display-chord and
+-- shoulder-hotkey gates before it routes to the capturing state, so the
+-- button state table must exist first
+Input:init()
 Game.gamepadpressed(gpGame, nil, "y")
 check(sawPad == "y", "pad buttons reach a capturing top state")
-Input:init()
 gpGame.stack:pop()
 Game.gamepadpressed(gpGame, nil, "a")
 Input:step()
@@ -473,8 +598,9 @@ local pm = PartyMenu.new(pgame)
 pm.game = pgame
 pgame.stack:push(pm)
 press(pm, "a")
-check(pm.submenu and #pm.subItems == 2
-  and pm.subItems[1].label == "STATS" and pm.subItems[2].label == "SWITCH",
+check(pm.submenu and #pm.subItems == 3
+  and pm.subItems[1].label == "STATS" and pm.subItems[2].label == "SWITCH"
+  and pm.subItems[3].label == "CANCEL",
   "vanilla party submenu unchanged with no hooks")
 pm.submenu = nil
 
@@ -485,9 +611,9 @@ hooks:wrap("ui.party.submenu", function(nextFn, game, items, mon, ctx)
   return nextFn(game, items, mon, ctx)
 end, 0, "fixture")
 press(pm, "a")
-check(#pm.subItems == 3 and pm.subItems[3].label == "QUESTS",
+check(#pm.subItems == 4 and pm.subItems[4].label == "QUESTS",
   "hook appends a party submenu entry")
-pm.subIndex = 3
+pm.subIndex = 4
 press(pm, "a")
 check(ranWith == pgame.save.party[1],
   "an injected entry's onSelect runs with the focused mon")
@@ -496,9 +622,24 @@ hooks:removeOwner("fixture")
 
 hooks:wrap("ui.party.submenu", function() return nil end, 0, "bad")
 press(pm, "a")
-check(#pm.subItems == 2, "a non-table submenu result keeps the vanilla list")
+check(#pm.subItems == 3, "a non-table submenu result keeps the vanilla list")
 hooks:removeOwner("bad")
 pm.submenu = nil
+
+-- ------- #768: the party cursor persists until a battle
+-- (PartyMenuInit reads wPartyAndBillsPCSavedMenuItem, HandlePartyMenuInput
+-- writes it back; InitBattleVariables / end_of_battle.asm zero it)
+pgame.save.party[2] = { species = "PIKACHU", hp = 10, stats = { hp = 10 },
+                        level = 5, moves = { { id = "TACKLE" } } }
+press(pm, "down")
+check(pgame.partyMenuSavedIndex == 2, "the party cursor is saved on move")
+local pm2 = PartyMenu.new(pgame)
+check(pm2.index == 2, "reopening the party menu keeps the cursor (#768)")
+pgame.save.party[2] = nil
+check(PartyMenu.new(pgame).index == 1,
+  "a shrunken party clamps the saved cursor back into range")
+pgame.partyMenuSavedIndex = nil -- a battle clears it (InitBattleVariables)
+check(PartyMenu.new(pgame).index == 1, "a battle resets the party cursor")
 
 -- ------- battle PKMN: SWITCH / STATS / CANCEL (#180)
 local switched
@@ -531,6 +672,39 @@ fgame.stack:push(fpm)
 press(fpm, "a")
 check(not fpm.submenu and forced == fgame.save.party[1],
   "forceSwitch still picks immediately (ChooseNextMon / SHIFT)")
+
+-- ------- issues #320/#385: the STRENGTH texts print over the party menu
+do
+  -- PartyMenu delegates the move to OverworldState:useStrengthFieldMove;
+  -- parity_I_M covers that side, this one covers what the menu does after
+  local owStub = { strengthActive = false,
+                   map = { def = { tileset = "OVERWORLD" } }, dark = false,
+                   partyKnows = function(self, id) return self.knows == id end,
+                   knows = "STRENGTH" }
+  local sgame = partyGame()
+  owStub.useStrengthFieldMove = function(self, _mon, onClose)
+    self.strengthActive = true
+    sgame.stack:push(require("src.render.TextBox").new(
+      sgame, "used\nSTRENGTH.", onClose))
+    return true
+  end
+  sgame.overworld = owStub
+  sgame.data.text = {} -- the strength texts fall back to Strings sources
+  sgame.save.inventory.RAINBOWBADGE = 1
+  sgame.save.party[1].moves = { { id = "STRENGTH" } }
+  local pm = PartyMenu.new(sgame)
+  pm.game = sgame
+  sgame.stack:push(pm)
+  press(pm, "a") -- open the submenu
+  check(pm.subItems[1].action == "strength",
+    "the strength row is listed with badge + move, above STATS/SWITCH (#768)")
+  pm.subIndex = 1
+  press(pm, "a") -- run STRENGTH
+  local states = sgame.stack.states
+  check(#states == 2 and states[1] == pm and states[2].pages ~= nil,
+    "the strength text sits over the still-open party menu")
+  check(owStub.strengthActive == true, "strength still activates")
+end
 
 -- ------- mod.ui helpers and theme defaults
 local items = { { label = "A" }, { label = "B" } }
@@ -646,8 +820,14 @@ do
 end
 
 -- issue #133: title menu / continue overlays must not inherit LOGO2/LOGO1
--- (blue/red UI ink).  A trailing trueColor zone covers the overlay box.
+-- (blue/red UI ink).  A trailing GRAYS zone covers the overlay box: through
+-- the shade-remap shader it is the identity for the box's DMG shades, so
+-- pass-through modes keep #133's white paper / black ink, while the mono
+-- and inverted display modes still recolor it with the rest of the screen
+-- (a trueColor rect skipped the shader and left a raw white hole over a
+-- CLASSIC pea-green title, #870).
 do
+  local PaletteFX = require("src.render.PaletteFX")
   local logo2 = {
     { 255, 255, 255 }, { 230, 197, 0 }, { 148, 156, 148 }, { 41, 99, 181 },
   }
@@ -676,8 +856,8 @@ do
   menu.titleUiBox = { 0, 0, 12, 3 }
   game.stack:push(menu)
   local withMenu = TitleState.sgbPalettes(title, game)
-  check(withMenu and #withMenu == 4 and withMenu[4].colors == false,
-        "title menu adds a trueColor overlay zone")
+  check(withMenu and #withMenu == 4 and withMenu[4].colors == PaletteFX.GRAYS,
+        "title menu adds a DMG-grays overlay zone (#870)")
   check(withMenu[4].x == 0 and withMenu[4].y == 0
         and withMenu[4].w == 13 * 8 and withMenu[4].h == 4 * 8,
         "menu overlay covers the CONTINUE/NEW GAME box")
@@ -685,8 +865,8 @@ do
   game.stack:pop()
   game.stack:push({ titleUiBox = { 4, 7, 19, 16 } })
   local withCont = TitleState.sgbPalettes(title, game)
-  check(withCont and #withCont == 4 and withCont[4].colors == false,
-        "continue-info overlay adds a trueColor zone")
+  check(withCont and #withCont == 4 and withCont[4].colors == PaletteFX.GRAYS,
+        "continue-info overlay adds a DMG-grays zone (#870)")
   check(withCont[4].x == 4 * 8 and withCont[4].y == 7 * 8
         and withCont[4].w == 16 * 8 and withCont[4].h == 10 * 8,
         "continue overlay matches DisplayContinueGameInfo's box")
@@ -746,8 +926,9 @@ check(oak.demoSpecies == "NIDORINO" and oak.nameLen == 7,
 
 -- ------- intro.oak_speech.build
 local vanillaSteps = OakSpeech.defaultSteps(oak)
-check(#vanillaSteps == 9, "vanilla speech has nine steps")
-check(vanillaSteps[1].id == "oak_welcome" and vanillaSteps[9].id == "shrink",
+check(#vanillaSteps == 11, "vanilla speech has eleven steps")
+check(vanillaSteps[1].id == "oak_welcome"
+  and vanillaSteps[#vanillaSteps].id == "shrink",
   "vanilla speech anchors start and end")
 
 hooks:wrap("intro.oak_speech.build", function(nextFn, steps, speech)
@@ -766,7 +947,7 @@ hooks:removeOwner("fixture")
 
 hooks:wrap("intro.oak_speech.build", function() return 42 end, 0, "bad")
 built = oak:buildSteps()
-check(#built == 9 and built[1].id == "oak_welcome",
+check(#built == #vanillaSteps and built[1].id == "oak_welcome",
   "a non-table intro.oak_speech.build result degrades to vanilla")
 check(logged("intro.oak_speech.build returned"),
   "the intro build degrade is logged")
@@ -938,8 +1119,10 @@ press(ms, "select")
 check(avail[1].enabled == false, "SELECT quick-toggles the focused mod")
 check(ms:isStaged(avail[1]), "a flip against boot state is staged")
 check(ms:glyphFor(avail[1]) == ".", "staged mods show the staged glyph")
-check(mgame.save.options.mods.badmod == false,
-  "the live options table mirrors the flip")
+local managerScope = ms:enableScope()
+check(managerScope and mgame.save.options.modsByVersion
+  and mgame.save.options.modsByVersion[managerScope].badmod == false,
+  "the live options table mirrors the flip for this game")
 check(ms.restartPending, "staged changes arm the apply screen")
 ms:discardChanges()
 check(avail[1].enabled == true and not ms.restartPending,
@@ -1023,6 +1206,27 @@ check(loader.modOptions.okmod.hardcore == false
   and loader.modOptions.okmod.startMoney == 3000
   and loader.modOptions.okmod.tag == "BLUE",
   "RESET DEFAULTS restores every schema default")
+
+-- optional conditions keep mode-specific rows compact and refresh in place
+local conditionalSchema = {
+  { key = "mode", label = "MODE", type = "choice", default = "one",
+    choices = { { "ONE", "one" }, { "TWO", "two" } } },
+  { key = "oneOnly", label = "ONE ONLY", type = "toggle", default = false,
+    visible_if = { key = "mode", equals = "one" } },
+  { key = "twoOnly", label = "TWO ONLY", type = "toggle", default = false,
+    visible_if = { key = "mode", equals = "two" } },
+  { key = "notOne", label = "NOT ONE", type = "toggle", default = false,
+    visible_if = { key = "mode", not_equals = "one" } },
+}
+loader.modOptions.condmod = {}
+ms.cursor = 1
+ms.optionRows = ms:buildOptionRows({ id = "condmod" }, conditionalSchema)
+check(#ms.optionRows == 3 and ms.optionRows[2].id == "oneOnly",
+  "visible_if uses the controlling row default")
+ms.optionRows[1].step(mgame, 1)
+check(#ms.optionRows == 4 and ms.optionRows[2].id == "twoOnly"
+  and ms.optionRows[3].id == "notOne" and ms.cursor == 1,
+  "editing a controller refreshes conditions without moving the cursor")
 press(ms, "b")
 check(ms.screen == "list", "B leaves the options screen")
 
@@ -1050,6 +1254,48 @@ check(easy.name == "HARD" and ms:optionsTable().activeProfile == "HARD",
 ms:deleteProfile(easy)
 check(ms:findProfile("HARD") == nil
   and ms:optionsTable().activeProfile == nil, "delete clears the profile")
+
+-- #593: a profile carries mod options and the per-version save slot, and
+-- round-trips through the .g1rmodlist export
+local ModProfile = require("src.mods.ModProfile")
+ms:setOption("okmod", "hardcore", true)
+ms:saveCurrentAs()
+mgame.stack:top().onDone("SHARE")
+mgame.stack:pop()
+local shared = ms:findProfile("SHARE")
+check(shared.options.okmod.hardcore == true,
+  "a profile snapshots per-mod options, not just the enable set")
+ms:setOption("okmod", "hardcore", false)
+ms:applyProfile(shared)
+check(loader.modOptions.okmod.hardcore == true,
+  "applying a profile restores its mod options")
+local wire = ModProfile.encode(shared)
+local back = ModProfile.decode(wire)
+check(back and back.name == "SHARE" and back.options.okmod.hardcore == true,
+  "a .g1rmodlist body round-trips through the data-only parser")
+check(ModProfile.decode("return {}") == nil, "a non-modlist file is refused")
+check(#ModProfile.missingIds({ enabled = { ghost = true } }, ms.byId) == 1,
+  "a profile naming an uninstalled mod reports it missing")
+local seedOpts = { modProfiles = {} }
+ModProfile.ensureFirst(seedOpts, ms.status.available, {})
+check(#seedOpts.modProfiles == 1 and seedOpts.modProfiles[1].name == "PROFILE 1"
+  and seedOpts.modProfilesSeeded == true,
+  "the pre-profiles setup migrates into PROFILE 1 once")
+seedOpts.modProfiles = {}
+ModProfile.ensureFirst(seedOpts, ms.status.available, {})
+check(#seedOpts.modProfiles == 0, "seeding never runs twice")
+
+local LauncherMods = require("src.mods.LauncherMods")
+local testProfOpts = { activeProfile = "P1", modProfiles = { { name = "P1", enabled = { a = true } } } }
+local dupSnap = LauncherMods.duplicateProfile("P1", testProfOpts)
+check(dupSnap and dupSnap.name == "P1 (Copy)" and testProfOpts.activeProfile == "P1 (Copy)",
+  "duplicateProfile creates P1 (Copy) and activates it")
+check(LauncherMods.renameProfile("P1 (Copy)", "RenamedP", testProfOpts) == true,
+  "renameProfile renames active profile")
+check(testProfOpts.activeProfile == "RenamedP", "activeProfile updates on rename")
+check(LauncherMods.deleteProfile("RenamedP", testProfOpts) == true, "deleteProfile removes profile")
+check(#testProfOpts.modProfiles == 1 and testProfOpts.modProfiles[1].name == "P1", "only original profile remains")
+check(testProfOpts.activeProfile == "P1", "activeProfile falls back to remaining profile")
 
 -- permissions rows
 local permy = manifest("permy", { permissions = { "network" } })
@@ -1087,7 +1333,7 @@ local Loader = require("src.mods.Loader")
 local uiFiles = {
   ["mods/uikit/manifest.json"] =
     '{"id":"uikit","name":"uikit","version":"1.0.0","entry":"main.lua","api":2}',
-  ["mods/uikit/main.lua"] = "return function(mod) _G.MOD_UI_API = mod end",
+  ["mods/uikit/main.lua"] = "return function(mod) mod.exports.api = mod end",
 }
 local uiFs = {
   read = function(path) return uiFiles[path] end,
@@ -1121,8 +1367,7 @@ local uiFs = {
 }
 local uiLoader = Loader.new({ fs = uiFs })
 check(uiLoader:load({}) == true, "the uikit fixture loads clean")
-local uiApi = _G.MOD_UI_API
-_G.MOD_UI_API = nil
+local uiApi = (uiLoader.exports.uikit or {}).api
 check(uiApi ~= nil, "the entry chunk received its api")
 check(uiApi.ui == ModUI, "mod.ui is the toolkit facade")
 check(uiApi.ui.Theme == Theme, "mod.ui.Theme reaches the theme module")

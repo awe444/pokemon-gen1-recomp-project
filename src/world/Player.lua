@@ -4,6 +4,7 @@
 
 local Collision = require("src.world.Collision")
 local FieldDefaults = require("src.world.FieldDefaults")
+local GameVersion = require("src.core.GameVersion")
 local Runtime = require("src.mods.Runtime")
 local SpriteRenderer = require("src.render.SpriteRenderer")
 
@@ -11,10 +12,24 @@ local Player = {}
 Player.__index = Player
 
 local STEP_FRAMES = 16
--- a turn in place holds for the ~2 frames the original spends on the
--- extra OverworldLoop pass (home/overworld.asm .handleDirectionButtonPress
--- returns to the loop without moving after a direction change)
-local TURN_FRAMES = 2
+-- a turn in place blocks movement for the one extra OverworldLoop pass the
+-- original spends after a direction change: .handleDirectionButtonPress ends
+-- `jp OverworldLoop` (home/overworld.asm), and OverworldLoop burns two
+-- DelayFrame calls before the next JoypadOverworld, so the step can only
+-- commit at the following poll -- the same 2-frames-per-iteration cadence
+-- that makes STEP_FRAMES 16 above (wWalkCounter = 8, 2px per
+-- AdvancePlayerSprite).
+-- Those polls sit on a 2-frame grid, so the hardware samples a press 0 or 1
+-- frames after the d-pad physically goes down and the release deadline lands
+-- 2 or 3 frames after that.  We sample on the frame the button goes down
+-- with none of that poll latency, so a flat 2 handed every tap the tightest
+-- case the original could produce; 4 covers the grid instead of
+-- undercutting it (#415).
+local TURN_FRAMES = 4
+-- The on-screen d-pad cannot produce a 60ms tap: a finger press and release
+-- run well past it even before the OS batches the touch events, so the
+-- overlay gets a longer window than a physical pad (#415).
+local TOUCH_TURN_FRAMES = 8
 
 function Player.new(data, cx, cy, facing)
   local self = setmetatable({}, Player)
@@ -26,10 +41,17 @@ function Player.new(data, cx, cy, facing)
   -- LoadSurfingPlayerSpriteGraphics, home/overworld.asm)
   local walkId = FieldDefaults.fieldValue(data, "playerSprites", "walk")
   local surfId = FieldDefaults.fieldValue(data, "playerSprites", "surf")
+  local surfPikaId = FieldDefaults.fieldValue(data, "playerSprites", "surfPikachu")
   local bikeId = FieldDefaults.fieldValue(data, "playerSprites", "bike")
   self.sprite = SpriteRenderer.new(data.sprites[walkId], "player")
   if surfId and data.sprites[surfId] then
     self.surfSprite = SpriteRenderer.new(data.sprites[surfId], "player")
+  end
+  -- Yellow's surfing-Pikachu ride (Yellow LoadSurfingPlayerSpriteGraphics2,
+  -- paired with field.playerSprites.surfPikachu). rotated in at pose()
+  -- when the SURF-mon is a Pikachu.
+  if surfPikaId and data.sprites[surfPikaId] then
+    self.surfPikachuSprite = SpriteRenderer.new(data.sprites[surfPikaId], "player")
   end
   if bikeId and data.sprites[bikeId] then
     self.bikeSprite = SpriteRenderer.new(data.sprites[bikeId], "player")
@@ -41,6 +63,20 @@ function Player.new(data, cx, cy, facing)
     local ok, img = pcall(love.graphics.newImage, fx.shadow.path)
     self.shadowImg = ok and img or nil
   end
+  -- FishingAnim (engine/overworld/player_animations.asm) patches tiles
+  -- $02/$06/$0a -- the bottom tile row of each standing frame -- with
+  -- RedFishingTiles before it parks the rod OAM, so the rod stroke meets a
+  -- pair of hands instead of ending in mid air (#384)
+  if fx then
+    local function posePath(name)
+      local def = fx[name]
+      return def and def.path or nil
+    end
+    local pose = { down = posePath("redFishFront"), up = posePath("redFishBack") }
+    pose.left = posePath("redFishSide")
+    pose.right = pose.left -- the side pose mirrors like the sprite (OAM_XFLIP)
+    if pose.down or pose.up or pose.left then self.fishTiles = pose end
+  end
   self.cellX, self.cellY = cx, cy
   self.px, self.py = cx * 16, cy * 16
   self.facing = facing or "down"
@@ -48,6 +84,11 @@ function Player.new(data, cx, cy, facing)
   self.progress = 0
   self.stepFlip = false
   self.turnTimer = 0
+  -- wCheckFor180DegreeTurn (home/overworld.asm): the original only lets a
+  -- turn in place happen on a poll whose previous pass found no direction
+  -- held.  It starts armed, tryMove spends it, and OverworldState:handleInput
+  -- re-arms it from a standstill.
+  self.turnArmed = true
   self.inputLocked = false
   return self
 end
@@ -56,14 +97,55 @@ function Player:position()
   return self.cellX, self.cellY
 end
 
+-- How long a fresh turn holds the step off for; see TURN_FRAMES.  The
+-- overlay is detected per source rather than by whether the touch controls
+-- are on screen, so a phone with a controller attached still gets the
+-- physical pad's window (Input:isTouchDown, src/core/Input.lua).
+function Player:turnWindow()
+  local frames = self.turnFrames or TURN_FRAMES
+  local input = require("src.core.Game").input
+  if input and input.isTouchDown and input:isTouchDown(self.facing) then
+    return math.max(frames, TOUCH_TURN_FRAMES)
+  end
+  return frames
+end
+
+-- the bicycle doubles walking speed (8 frames per step); movement.speed
+-- lets a mod multiply or replace that (running shoes, dash, etc.)
+-- DoBikeSpeedup is skipped mid-hop -- home/overworld.asm:283
+function Player:stepLength()
+  local Game = require("src.core.Game")
+  local save = Game.save
+  local onBike = (save and save.onBike and not self.ledgeHop) or false
+  local frames = onBike and self.bikeStepFrames or self.stepFrames or STEP_FRAMES
+  if Runtime.wantsHook("movement.speed") then
+    frames = Runtime.call("movement.speed", function(f) return f end, frames, {
+      onBike = onBike,
+      surfing = self.surfing and true or false,
+      player = self,
+      input = Game.input,
+      save = save,
+    })
+  end
+  return math.max(1, math.floor(tonumber(frames) or STEP_FRAMES))
+end
+
 -- Attempt to start a step; returns "moved"|"turned"|"blocked"|nil.
 function Player:tryMove(dir, map, entities)
   if self.moving or self.inputLocked then return nil end
   if self.facing ~= dir then
     self.facing = dir
-    self.turnTimer = self.turnFrames or TURN_FRAMES
     self.bumpFrames = nil -- turning to a new facing ends any wall-bonk cycle
-    return "turned"
+    -- .handleDirectionButtonPress only reaches the turn while
+    -- wCheckFor180DegreeTurn is still set, and .noDirectionButtonsPressed is
+    -- the one place that sets it (home/overworld.asm), so a facing change
+    -- made without the d-pad ever coming up steps straight away rather than
+    -- paying the turn delay at every corner (#415)
+    if self.turnArmed then
+      self.turnArmed = false
+      self.turnTimer = self:turnWindow()
+      return "turned"
+    end
   end
   if self.turnTimer > 0 then return nil end
   local ok, why = Collision.canMove(map, entities, self, dir)
@@ -83,22 +165,7 @@ function Player:tryMove(dir, map, entities)
   self.moving = true
   self.bumpFrames = nil -- a real step supersedes any in-place bonk
   self.progress = 0
-  -- the bicycle doubles walking speed (8 frames per step); movement.speed
-  -- lets a mod multiply or replace that (running shoes, dash, etc.)
-  local Game = require("src.core.Game")
-  local save = Game.save
-  local frames = (save and save.onBike) and self.bikeStepFrames
-                 or self.stepFrames or STEP_FRAMES
-  if Runtime.wantsHook("movement.speed") then
-    frames = Runtime.call("movement.speed", function(f) return f end, frames, {
-      onBike = save and save.onBike or false,
-      surfing = self.surfing and true or false,
-      player = self,
-      input = Game.input,
-      save = save,
-    })
-  end
-  self.stepFramesCur = math.max(1, math.floor(tonumber(frames) or STEP_FRAMES))
+  self.stepFramesCur = self:stepLength()
   return "moved"
 end
 
@@ -114,6 +181,9 @@ function Player:update()
   end
   if self.turnTimer > 0 then
     self.turnTimer = self.turnTimer - 1
+  end
+  if self.spinning then
+    self.spinTimer = (self.spinTimer or 0) + 1
   end
   if self.spinFrames then
     self.spinFrames = self.spinFrames - 1
@@ -152,7 +222,7 @@ function Player:update()
     self.stepFlip = not self.stepFlip
     -- keep animClock's pose on this frame (issue #82): bike steps land
     -- mid-cycle (animClock % 16 == 8), and walkPhase used to snap to
-    -- stand whenever moving cleared — a stand flash every tile on the
+    -- stand whenever moving cleared -- a stand flash every tile on the
     -- bike, and sometimes after dismount when the clock is desynced
     self.stepLanded = true
     return true
@@ -164,7 +234,16 @@ function Player:facingCell()
   return Collision.target(self.cellX, self.cellY, self.facing)
 end
 
+-- UpdatePlayerSprite jumps to .notMoving while BIT_FONT_LOADED is set
+-- -- engine/overworld/movement.asm:57
+local function textBoxUp()
+  local stack = require("src.core.Game").stack
+  local top = stack and stack.top and stack:top()
+  return top ~= nil and not top.isOverworld
+end
+
 function Player:walkPhase()
+  if textBoxUp() then return 0 end
   -- moving, the land-frame after a completed step, or an active wall-bonk
   -- (issue #230) animate; a standing sprite otherwise
   if not self.moving and not self.stepLanded
@@ -185,11 +264,6 @@ local SPIN_ORDER = { "down", "left", "up", "right" }
 --
 -- The last return says the player is mid-ledge-hop, which is what the 2D
 -- path draws the ground shadow from and a 3D path turns into vertical lift.
---
--- This ADVANCES the surf-bob and spinner timers, so exactly one of pose()
--- and draw() may run per frame -- and draw() is written in terms of pose()
--- to keep that true by construction.  (hopFrames counts down in
--- Player:update, on the fixed step, so it is safe to read here.)
 function Player:pose()
   local py = self.py
   local hopping = false
@@ -205,6 +279,8 @@ function Player:pose()
     self.bobTimer = ((self.bobTimer or 0) + 1) % 32
     py = py + (self.bobTimer < 16 and 0 or 1)
   end
+  -- engine/overworld/player_animations.asm:453
+  py = py + (self.fishShakeDy or 0)
   local facing = self.facing
   local phase = self:walkPhase()
   -- alternate walk cycles mirror the up/down frame; derived from the
@@ -212,10 +288,8 @@ function Player:pose()
   -- the leg cadence
   local flip = math.floor((self.animClock or 0) / 16) % 2 == 1
   if self.spinning then
-    -- spinner tiles whirl the sprite on its standing pose, one facing
-    -- per frame (LoadSpinnerArrowTiles runs every OverworldLoop frame)
-    self.spinTimer = (self.spinTimer or 0) + 1
-    facing = SPIN_ORDER[self.spinTimer % 4 + 1]
+    -- spinners.asm:1-11, home/overworld.asm:41-44, :268-272
+    facing = SPIN_ORDER[math.floor((self.spinTimer or 0) / 2) % 4 + 1]
     phase, flip = 0, false
     -- teleport arrivals spin the sprite down into place
     -- (EnterMapAnim PlayerSpinWhileMovingDown)
@@ -230,24 +304,57 @@ function Player:pose()
       py = py - math.floor((total - self.spinFrames) * 24 / total)
     end
   end
-  local sprite = (self.surfing and self.surfSprite)
+  -- RodResponse (engine/items/item_effects.asm) zeroes wWalkBikeSurfState
+  -- across FishingAnim, so casting from the water shows the on-foot sheet
+  local sprite = (self.fishing and self.sprite)
+                 or (self.surfing and self.surfingPikachu and self.surfPikachuSprite)
+                 or (self.surfing and self.surfSprite)
                  or (self.onBike and self.bikeSprite) or self.sprite
   return sprite, self.px, py, facing, phase, flip, hopping
 end
 
 function Player:draw(camX, camY)
   local sprite, px, py, facing, phase, flip, hopping = self:pose()
-  -- the shadow stays on the ground under the jumper: one 8x8 tile
-  -- mirrored into a 2x2 block (normal/XFLIP/YFLIP/both) whose top-left
-  -- is 8px below the sprite's standing top-left (LoadHoppingShadowOAM +
-  -- LedgeHoppingShadowOAMBlock, engine/overworld/ledges.asm)
+  -- the shadow stays on the ground under the jumper, mirrored out of the
+  -- single 8x8 tile the ROM stores -- but the two engines lay it out
+  -- differently, and their shadow.png tiles differ to match.
+  --   RED/BLUE: a 2x2 block (normal/XFLIP/YFLIP/both) whose top-left sits
+  --   8px below the sprite's standing top-left (LoadHoppingShadowOAM +
+  --   LedgeHoppingShadowOAMBlock at "lb bc, $54, $48",
+  --   engine/overworld/ledges.asm); its tile is blank above the bottom
+  --   four rows, so the four copies make one 16x16 ellipse.
+  --   YELLOW: a single 16x8 row 4px lower.  Its LoadHoppingShadowOAM
+  --   copies only two entries (LedgeHoppingShadowOAM: dbsprite 9,11 and
+  --   dbsprite 10,11 OAM_XFLIP, raw OAM y=88 against RED's $54=84) and
+  --   parks sprites 38/39 offscreen at y=$a0, because its tile is a
+  --   full-height half-ellipse that already fills the row.  Mirroring
+  --   that tile downward stacked a second blob under the first (#408).
   if hopping and self.shadowImg then
+    local yellow = GameVersion.isYellow()
     local sx = math.floor(self.px - camX)
-    local sy = math.floor(self.py - camY) - 4 + 8
+    local sy = math.floor(self.py - camY) - 4 + 8 + (yellow and 4 or 0)
     love.graphics.draw(self.shadowImg, sx, sy)
     love.graphics.draw(self.shadowImg, sx + 16, sy, 0, -1, 1)
-    love.graphics.draw(self.shadowImg, sx, sy + 16, 0, 1, -1)
-    love.graphics.draw(self.shadowImg, sx + 16, sy + 16, 0, -1, -1)
+    if not yellow then
+      love.graphics.draw(self.shadowImg, sx, sy + 16, 0, 1, -1)
+      love.graphics.draw(self.shadowImg, sx + 16, sy + 16, 0, -1, -1)
+    end
+  end
+  -- Fishing pose: the standing frame with its bottom tile row swapped for
+  -- RedFishingTiles, which is where the hands and the near half of the rod
+  -- live; the far half is the rod OAM OverworldState draws (FishingRodOAM,
+  -- engine/overworld/player_animations.asm) -- #384
+  local fishTile = self.fishing and self.fishTiles and self.fishTiles[facing]
+  if fishTile then
+    sprite:draw(px, py, camX, camY, facing, 0, false, true)
+    -- The fishing pose replaces the bottom 8-pixel tile.  Use the sprite's
+    -- actual anchored frame origin so larger/custom sheets keep the pose at
+    -- their feet instead of falling back to the vanilla 16x16 top-left.
+    local sx, sy = sprite:getScreenOrigin(px, py, camX, camY)
+    sprite:drawTile(fishTile, sx,
+                    sy + math.max(0, sprite.frameHeight - 8),
+                    facing == "right")
+    return
   end
   sprite:draw(px, py, camX, camY, facing, phase, flip)
 end

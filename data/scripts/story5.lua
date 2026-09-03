@@ -4,9 +4,9 @@ local M = {}
 
 local function text(game) return game.data.text end
 
-local function push(game, s, done)
+local function push(game, s, done, opts)
   local TextBox = require("src.render.TextBox")
-  game.stack:push(TextBox.new(game, s, done))
+  game.stack:push(TextBox.new(game, s, done, opts))
 end
 
 -- fill the extracted text placeholders ({RAM:...}, {PLAYER})
@@ -25,8 +25,8 @@ local function gift(opts)
     local t = text(game)
     local itemName = game.data.items[opts.item].name
     local subs = { ram = itemName, player = game.save.player.name }
-    local function say(label, fallback, cb)
-      push(game, fill(t[label] or fallback, subs), cb)
+    local function say(label, fallback, cb, sopts)
+      push(game, fill(t[label] or fallback, subs), cb, sopts)
     end
     if game.save.flags[opts.flag] then
       say(opts.already or opts.explain, "It's a useful\nitem, isn't it?", done)
@@ -39,17 +39,18 @@ local function gift(opts)
       end
       game.save.flags[opts.flag] = true
       local idef = game.data.items[opts.item]
-      require("src.core.Sound").play(game.data,
-        (idef and idef.keyItem) and "Get_Key_Item" or "Get_Item1")
+      -- the received texts carry sound_get_item_1 / sound_get_key_item, so
+      -- the jingle only fires once that box has typed out
       say(opts.received, "{PLAYER} received\n{RAM:}!", function()
         if opts.explain then
           say(opts.explain, "", done)
         else
           done()
         end
-      end)
+      end, require("src.render.TextBox").soundOpts(game,
+        (idef and idef.keyItem) and "Get_Key_Item" or "Get_Item1"))
     end
-    if opts.pre then say(opts.pre, "", give) else give() end
+    if opts.pre then say(opts.pre, opts.preFallback or "", give) else give() end
   end
 end
 
@@ -118,11 +119,20 @@ M.CINNABAR_LAB_METRONOME_ROOM = {
   },
 }
 
--- TM42 Dream Eater (scripts/ViridianCity.asm, the fisher; no pre text)
+-- TM42 Dream Eater (scripts/ViridianCity.asm, the fisher).  The fisher's
+-- YouCanHaveThisText prints before GiveItem, so this gift needs a pre
+-- text (#775).  Like the SilphCo2F worker (#393) that label carries no
+-- leading underscore; tools/extract/text.py now collects it regardless,
+-- so preFallback below is just the safety net for a catalog without it.
 M.VIRIDIAN_CITY = {
   talk = {
     TEXT_VIRIDIANCITY_FISHER = gift({
       flag = "EVENT_GOT_TM42", item = "TM_DREAM_EATER",
+      pre = "ViridianCityFisherYouCanHaveThisText",
+      preFallback = "Yawn!\nI must have dozed\voff in the sun."
+        .. "\fI had this dream\nabout a DROWZEE\veating my dream."
+        .. "\vWhat's this?\vWhere did this TM\vcome from?"
+        .. "\fThis is spooky!\nHere, you can\vhave this TM.",
       received = "_ViridianCityFisherReceivedTM42Text",
       explain = "_ViridianCityFisherTM42ExplanationText",
       noRoom = "_ViridianCityFisherTM42NoRoomText",
@@ -135,6 +145,11 @@ M.SILPH_CO_2F = {
   talk = {
     TEXT_SILPHCO2F_SILPH_WORKER_F = gift({
       flag = "EVENT_GOT_TM36", item = "TM_SELFDESTRUCT",
+      -- the label carries no leading underscore (#393); collected like any
+      -- other text/*.asm label now, preFallback is just the safety net
+      pre = "SilphCo2FSilphWorkerFPleaseTakeThisText",
+      preFallback = "Eeek!\nNo! Stop! Help!\fOh, you're not\nwith TEAM ROCKET."
+        .. "\vI thought...\vI'm sorry. Here,\vplease take this!",
       received = "_SilphCo2FSilphWorkerFReceivedTM36Text",
       explain = "_SilphCo2FSilphWorkerFTM36ExplanationText",
       noRoom = "_SilphCo2FSilphWorkerFTM36NoRoomText",
@@ -172,6 +187,20 @@ M.ROUTE_18_GATE_2F = {
     TEXT_ROUTE18GATE2F_YOUNGSTER = {
       { "face_player" },
       { "trade", 6, "EVENT_TRADED_SLOWBRO_FOR_LICKITUNG" }, -- MARC
+    },
+    -- Yellow replaces the youngster with a cook trading SPIKE
+    -- (TANGELA -> PARASECT): pokeyellow/scripts/Route18Gate2F.asm
+    -- Route18Gate2FCookText runs TRADE_FOR_SPIKE, index 6 in the Yellow
+    -- TradeMons table that Data:applyVersionedFieldData swaps in.  Red
+    -- maps have no COOK object here and Yellow maps have no YOUNGSTER,
+    -- so each version only ever fires its own row (#651).  Both rows
+    -- share the Red-flavoured done flag on purpose: a .sav tracks
+    -- "trade slot 6 completed" in one wCompletedInGameTradeFlags bit
+    -- either version reads, and the save codec maps that bit to this
+    -- flag name (src/save_convert/GenSave.lua EXTRA_FLAG_BITS).
+    TEXT_ROUTE18GATE2F_COOK = {
+      { "face_player" },
+      { "trade", 6, "EVENT_TRADED_SLOWBRO_FOR_LICKITUNG" }, -- SPIKE (Yellow)
     },
   },
 }
@@ -211,7 +240,7 @@ local function stepGate(opts)
     push(game, text(game)[opts.text] or opts.fallback, function()
       ow.player.facing = opts.push
       if not ow:checkLedgeHop(opts.push) then
-        ow:scriptMove(ow.player, opts.push, 1)
+        ow:scriptMove(ow.player, opts.push, 1, nil, { collide = true })
       end
     end)
     return true
@@ -293,7 +322,11 @@ pewterEscort.guySteps = {
   "right", "right", "right",
 }
 
--- Walk home: reverse of guySteps with opposite facings (gym → spawn).
+-- Reverse of guySteps with opposite facings, i.e. the gym-to-spawn
+-- mirror of RLEList_PewterGymGuy.  Kept as the documented inverse that
+-- tests/parity_pewter_escort.lua checks; the youngster does NOT walk it
+-- home any more, because its first step is LEFT through the player
+-- parked on (11,18) (#241).  See walkHome below.
 do
   local opp = { up = "down", down = "up", left = "right", right = "left" }
   local ret = {}
@@ -371,26 +404,50 @@ local function pewterGymEscort(game, ow)
   local head = plan.guyHeadStart
 
   -- After the walk: face the player, restore map music, "Go take on
-  -- BROCK", then retrace RLEList_PewterGymGuy back to his spawn (35,16).
-  -- (pokered teleports him via MovementData_PewterGymGuyExit; we walk
-  -- the same route home instead.  Brock victory still HideObject's him.)
+  -- BROCK", then MovementData_PewterGymGuyExit -- five steps RIGHT out of
+  -- (12,18), the cell PewterCityYoungsterShowsPlayerGymScript pins him to
+  -- with SetSpritePosition1 (hSpriteMapXCoord 16 / hSpriteMapYCoord 22,
+  -- minus the +4 border offset object_event coords carry per
+  -- macros/scripts/maps.asm) and exactly where the escort leaves him.
+  -- That lands him on (17,18), the last walkable cell before the fence at
+  -- (18,18) and one column past the screen edge with the player parked on
+  -- (11,18).  PewterCityHideYoungsterScript then HideObject's him and
+  -- PewterCityResetYoungsterScript's SetSpritePosition2 + ShowObject put
+  -- him back on his object_event spawn (35,16) facing DOWN, which is the
+  -- snap below (the vanish/reappear is off screen, same as the original).
+  --
+  -- The old code retraced guyReturnSteps instead, whose first step is
+  -- LEFT into (11,18) -- the cell the player is standing on -- and
+  -- scriptMove is a pure tween with no entity test, so he walked straight
+  -- through Red (#241).  There is no honest route home: (17,18) is a
+  -- dead-end pocket ((18,18) fence, (17,17) wall), which is precisely why
+  -- the original teleports.  guyReturnSteps stays as the documented
+  -- mirror of RLEList_PewterGymGuy that parity_pewter_escort asserts.
+  -- Brock victory still HideObject's him.
   local function walkHome()
     if not guy then return end
-    local ret = pewterEscort.guyReturnSteps
     local i = 0
     local function tick()
       i = i + 1
-      if not ret[i] then
+      if i > 5 then
+        -- SetSpritePosition2: same field writes as Commands.place_npc,
+        -- including the target clear -- a stale targetX/targetY would
+        -- leave OverworldState:npcAtCell reserving (17,18) forever and
+        -- silently wall the player out of that pocket.
+        guy.cellX, guy.cellY = 35, 16
+        guy.px, guy.py = 35 * 16, 16 * 16
+        guy.moving = false
+        guy.targetX, guy.targetY = nil, nil
         guy.facing = "down"
         return
       end
-      ow:scriptMove(guy, ret[i], 1, tick)
+      ow:scriptMove(guy, "right", 1, tick)
     end
     tick()
   end
 
   local function afterWalk()
-    if guy then guy.facing = "left" end
+    if guy then guy.stepFrames, guy.facing = nil, "left" end
     Music.playMap(game.data, "PEWTER_CITY")
     push(game, t._PewterCityYoungsterGoTakeOnBrockText
       or "Go take on BROCK\nat the GYM first!", walkHome)
@@ -413,6 +470,11 @@ local function pewterGymEscort(game, ow)
   end
 
   local function beginWalk()
+    -- the escort runs the youngster on the player's own frames per cell
+    -- engine/overworld/movement.asm:737 (DoScriptedNPCMovement)
+    if guy then
+      guy.stepFrames = ow.player.stepFramesCur or ow.player.stepFrames
+    end
     Music.play(game.data, "Music_MuseumGuy")
     if guy and head > 0 then
       local h = 0
@@ -453,12 +515,12 @@ M.PEWTER_CITY = {
 -- Rival ambush: show the hidden rival, walk him up to the player, run
 -- the battle rows, march him back and hide him.  On a loss the walk is
 -- skipped (the blackout rebuilds the map mid-script).
-local function runAmbush(game, ow, rows, playerFacing)
+local function runAmbush(game, ow, rows, playerFacing, musicOpts)
   if ow.runner:isRunning() then return false end
   ow.player.facing = playerFacing
   -- the rival encounter sting (MUSIC_MEET_RIVAL); the battle music
   -- takes over and the map theme returns after the victory jingle
-  require("src.core.Music").play(game.data, "Music_MeetRival")
+  require("src.core.Music").play(game.data, "Music_MeetRival", nil, musicOpts)
   ow.runner:run(rows)
   return true
 end
@@ -468,48 +530,82 @@ end
 -- Gym) and again in Viridian Gym; we derive the same windows from the
 -- surrounding story flags so old saves work too.
 -- Rival1Exit → Viridian (right/down); Rival2Exit → League (left).
+-- Both exit lists are keyed on wSavedCoordIndex -- WHICH entry of
+-- Route22DefaultScript.Route22RivalBattleCoords the player matched -- not
+-- on where the rival ended up.  CheckCoords (home/map_objects.asm:107)
+-- zeroes wCoordIndex and `inc [hl]` BEFORE each compare, so the first
+-- entry reports 1: index 1 is (29,4), index 2 is (29,5).
+-- Route22Rival1AfterBattleScript (Route22.asm:175) takes
+-- ...ExitMovementData1 on index 1 and ...Data2 otherwise.  From the top
+-- tile the rival stands BELOW the player on (29,5) and leaves east along
+-- row 5; from the bottom tile he stands LEFT of him on (28,5) and has to
+-- step UP to row 4 to get around him.  The port had the two branches
+-- swapped, so the top tile started the walk with UP out of (28,4) into
+-- the cliff cell (28,3), which is not walkable (#236).
 local function route22ExitDirs(n, py)
   if n == 2 then
-    if py == 5 then return { "left", "left", "left", "left" } end
+    -- Route22Rival2ExitMovementData1 falls through into ...Data2: LEFT x4
+    -- from (29,5), LEFT x3 from (28,5), both back onto the spawn (25,5).
+    if py == 4 then return { "left", "left", "left", "left" } end
     return { "left", "left", "left" }
   end
-  if py == 5 then
+  -- Route22Rival1ExitMovementData1: (29,5) -> (31,5) -> (31,10)
+  if py == 4 then
     return { "right", "right", "down", "down", "down", "down", "down" }
   end
+  -- Route22Rival1ExitMovementData2: (28,5) -> (28,4) -> (31,4) -> (31,10)
   return { "up", "right", "right", "right",
            "down", "down", "down", "down", "down", "down" }
 end
 
 local function route22Scene(n, objIndex, objName, oppClass, baseParty, beatFlag, py)
+  -- Route22MoveRivalRightScript (Route22.asm:39) walks him RIGHT along his
+  -- own row from the object_event spawn (25,5): the full four-RIGHT
+  -- Route22RivalMovementData on coord index 1 (player on (29,4)), so he
+  -- stops BELOW the player on (29,5); `inc de` drops one RIGHT on index 2
+  -- (player on (29,5)), so he stops LEFT of him on (28,5).  He never
+  -- leaves row 5.  Route22Rival{1,2}StartBattleScript (Route22.asm:110)
+  -- then faces him UP on index 1 and RIGHT otherwise (#236).
+  local rx = (py == 4) and 29 or 28
+  local rivalFacing = (py == 4) and "up" or "right"
   return {
     { "show_object", "ROUTE_22", objName },                    -- 1
-    { "move_npc_to", objIndex, 28, py },                       -- 2
-    { "face_object", objIndex, "right" },                      -- 3
+    { "move_npc_to", objIndex, rx, 5 },                        -- 2
+    { "face_object", objIndex, rivalFacing },                  -- 3
     { "show_text", "_Route22RivalBeforeBattleText" .. n },     -- 4
     { "rival_battle", oppClass, baseParty },                   -- 5
-    { "jump_if_false", 11 },                                   -- 6
+    { "jump_if_false", 13 },                                   -- 6
     { "set_flag", beatFlag },                                  -- 7
     { "show_text", "_Route22Rival" .. n .. "DefeatedText" },   -- 8
     { "show_text", "_Route22RivalAfterBattleText" .. n },      -- 9
-    { "walk_npc", objIndex, route22ExitDirs(n, py) },          -- 10
-    { "hide_object", "ROUTE_22", objName },                    -- 11
+    { "play_music", "Music_MeetRival", { start = "rival",
+      tempo = n == 2 and 100 or nil } },                     -- 10
+    { "walk_npc", objIndex, route22ExitDirs(n, py) },          -- 11
+    { "play_default_music" },                    -- scripts/Route22.asm:230
+    { "hide_object", "ROUTE_22", objName },                    -- 13
   }
 end
 
+-- Route22Rival{1,2}StartBattleScript turns the player toward him too:
+-- PLAYER_DIR_DOWN on coord index 1 (the (29,4) tile, rival below him),
+-- and the PLAYER_DIR_LEFT Route22DefaultScript already set on index 2
+-- (the (29,5) tile, rival to his left) (#236).
 M.ROUTE_22 = {
   onStep = function(game, ow, x, y)
     if not inCoords({ { 29, 4 }, { 29, 5 } }, x, y) then return false end
     local f = game.save.flags
+    local playerFacing = (y == 4) and "down" or "left"
     if f.EVENT_GOT_POKEDEX and not f.EVENT_BEAT_BROCK
        and not f.EVENT_BEAT_ROUTE22_RIVAL_1ST_BATTLE then
       return runAmbush(game, ow,
         route22Scene(1, 1, "ROUTE22_RIVAL1", "OPP_RIVAL1", 4,
-                     "EVENT_BEAT_ROUTE22_RIVAL_1ST_BATTLE", y), "left")
+                     "EVENT_BEAT_ROUTE22_RIVAL_1ST_BATTLE", y), playerFacing)
     end
     if f.EVENT_BEAT_GIOVANNI and not f.EVENT_BEAT_ROUTE22_RIVAL_2ND_BATTLE then
       return runAmbush(game, ow,
         route22Scene(2, 2, "ROUTE22_RIVAL2", "OPP_RIVAL2", 10,
-                     "EVENT_BEAT_ROUTE22_RIVAL_2ND_BATTLE", y), "left")
+                     "EVENT_BEAT_ROUTE22_RIVAL_2ND_BATTLE", y), playerFacing,
+        { tempo = 100 })
     end
     return false
   end,
@@ -533,43 +629,47 @@ local function ceruleanRivalScene(px, py)
     { "face_object", 1, "down" },                              -- 3
     { "show_text", "_CeruleanCityRivalPreBattleText" },        -- 4
     { "rival_battle", "OPP_RIVAL1", 7 },                       -- 5
-    { "jump_if_false", 11 },                                   -- 6
+    { "jump_if_false", 13 },                                   -- 6
     { "set_flag", "EVENT_BEAT_CERULEAN_RIVAL" },               -- 7
     { "show_text", "_CeruleanCityRivalDefeatedText" },         -- 8
     { "show_text", "_CeruleanCityRivalIWentToBillsText" },     -- 9
-    { "walk_npc", 1, ceruleanRivalExitDirs(px) },              -- 10
-    { "hide_object", "CERULEAN_CITY", "CERULEANCITY_RIVAL" },  -- 11
+    { "play_music", "Music_MeetRival", { start = "rival" } }, -- 10
+    { "walk_npc", 1, ceruleanRivalExitDirs(px) },              -- 11
+    { "play_default_music" },                -- scripts/CeruleanCity.asm:230
+    { "hide_object", "CERULEAN_CITY", "CERULEANCITY_RIVAL" },  -- 13
   }
 end
 
 -- scripts/CeruleanCity.asm CeruleanCityRocketText: fight the thief,
 -- then he returns TM28 (DIG) and hurries off.  CeruleanHideRocket
 -- (CeruleanCity_2.asm) is GBFadeOutToBlack → Show GUARD1 / Hide GUARD2 /
--- Hide ROCKET → GBFadeInFromBlack — not a bare hide_object.
+-- Hide ROCKET → GBFadeInFromBlack -- not a bare hide_object.
 local rocketRows = {
   { "face_player" },                                           -- 1
   { "check_flag", "EVENT_GOT_TM28" },                          -- 2
-  { "jump_if_true", 15 },                                      -- 3 → CeruleanHideRocket
+  { "jump_if_true", 16 },                                      -- 3 → CeruleanHideRocket
   { "check_flag", "EVENT_BEAT_CERULEAN_ROCKET_THIEF" },        -- 4
-  { "jump_if_true", 9 },                                       -- 5
+  { "jump_if_true", 10 },                                      -- 5
   { "show_text", "_CeruleanCityRocketText" },                  -- 6
-  { "start_battle", "trainer", "OPP_ROCKET", 5 },              -- 7
-  { "jump_if_false", "end" },                                  -- 8
-  { "show_text", "_CeruleanCityRocketIllReturnTheTMText" },    -- 9
-  { "set_flag", "EVENT_BEAT_CERULEAN_ROCKET_THIEF" },          -- 10
-  { "give_item", "TM_DIG", 1, false },                         -- 11 (row 13 prints)
-  { "set_flag", "EVENT_GOT_TM28" },                            -- 12
-  { "show_text", "_CeruleanCityRocketReceivedTM28Text" },      -- 13
-  { "show_text", "_CeruleanCityRocketIBetterGetMovingText" },  -- 14
-  { "fade", "out" },                                           -- 15 GBFadeOutToBlack
+  -- scripts/CeruleanCity.asm:297 SaveEndBattleTextPointers
+  { "save_end_battle_text", "_CeruleanCityRocketIGiveUpText" }, -- 7
+  { "start_battle", "trainer", "OPP_ROCKET", 5 },              -- 8
+  { "jump_if_false", "end" },                                  -- 9
+  { "show_text", "_CeruleanCityRocketIllReturnTheTMText" },    -- 10
+  { "set_flag", "EVENT_BEAT_CERULEAN_ROCKET_THIEF" },          -- 11
+  { "give_item", "TM_DIG", 1, false },                         -- 12 (row 14 prints)
+  { "set_flag", "EVENT_GOT_TM28" },                            -- 13
+  { "show_text", "_CeruleanCityRocketReceivedTM28Text" },      -- 14
+  { "show_text", "_CeruleanCityRocketIBetterGetMovingText" },  -- 15
+  { "fade", "out" },                                           -- 16 GBFadeOutToBlack
   -- CeruleanHideRocket while black: GUARD1 (28,12) appears, GUARD2
   -- (27,12) and the ROCKET go.  GUARD2 blocks the trashed-house south
-  -- door neighbour — the swap reconnects the city (Bill's ticket does
+  -- door neighbour -- the swap reconnects the city (Bill's ticket does
   -- the same in story.lua; either route is enough).
-  { "show_object", "CERULEAN_CITY", "CERULEANCITY_GUARD1" },   -- 16
-  { "hide_object", "CERULEAN_CITY", "CERULEANCITY_GUARD2" },   -- 17
-  { "hide_object", "CERULEAN_CITY", "CERULEANCITY_ROCKET" },   -- 18
-  { "fade", "in" },                                            -- 19 GBFadeInFromBlack
+  { "show_object", "CERULEAN_CITY", "CERULEANCITY_GUARD1" },   -- 17
+  { "hide_object", "CERULEAN_CITY", "CERULEANCITY_GUARD2" },   -- 18
+  { "hide_object", "CERULEAN_CITY", "CERULEANCITY_ROCKET" },   -- 19
+  { "fade", "in" },                                            -- 20 GBFadeInFromBlack
 }
 
 M.CERULEAN_CITY = {
@@ -628,13 +728,89 @@ M.MUSEUM_1F = {
 }
 
 -- The Pewter Center's singing JIGGLYPUFF (scripts/PewterPokecenter.asm
--- plays MUSIC_JIGGLYPUFF_SONG, then the map theme resumes)
+-- PewterPokecenterJigglypuffText).  The text_asm sets
+-- wDoNotWaitForButtonPressAfterDisplayingText before PrintText, so the box
+-- prints with no A prompt and the script keeps running underneath it:
+-- SFX_STOP_ALL_MUSIC, DelayFrames 32, PlayMusic MUSIC_JIGGLYPUFF_SONG,
+-- then .spinMovementLoop writes the next of DOWN -> LEFT -> UP -> RIGHT (a
+-- clockwise turn) every 24 frames for as long as the song's CHAN1/CHAN2
+-- still sound, DelayFrames 48, PlayDefaultMusic, TextScriptEnd.  Only that
+-- last step closes the box, so the whole dance plays out unskippably
+-- (#249).  Music.playOnce's pendingRestore stands in for both the channel
+-- poll and PlayDefaultMusic, so the Center's theme comes back the frame
+-- the song ends rather than 48 frames later.
+local JIGGLYPUFF_SPIN = { "down", "left", "up", "right" }
+local JIGGLYPUFF_SILENCE, JIGGLYPUFF_STEP, JIGGLYPUFF_TAIL = 32, 24, 48
+
+-- Built as a TextBox `auto` table: auto.sound fires the frame the last
+-- page has typed out (PrintText returning), and auto.tick then runs once
+-- per frame while the gate it returns still reads as playing.
+local function jigglypuffDance(game, npc, ow)
+  local Music = require("src.core.Music")
+  -- .findMatchingFacingDirectionLoop: the rotation picks up at the entry
+  -- matching the sprite's current facing (showMapText has just turned it
+  -- toward the player), and the first write is that same facing, so the
+  -- first visible quarter turn lands 24 frames in
+  local step = 1
+  for i, dir in ipairs(JIGGLYPUFF_SPIN) do
+    if npc and npc.facing == dir then step = i end
+  end
+  local frames, phase = 0, "silence"
+  return {
+    sound = function()
+      Music.stop() -- SFX_STOP_ALL_MUSIC
+      return { isPlaying = function() return phase ~= "done" end }
+    end,
+    tick = function()
+      frames = frames + 1
+      if phase == "silence" then
+        if frames < JIGGLYPUFF_SILENCE then return end
+        frames = 0
+        if Music.playOnce(game.data, "Music_JigglypuffSong") then
+          phase = "spin"
+        else
+          -- no song def (or headless): Music.stop above already took the
+          -- map theme down and nothing armed pendingRestore, so put it
+          -- back by hand and fall through to the tail rather than hold
+          -- the box on a poll that would never clear
+          Music.restoreMap(game.data)
+          phase = "tail"
+        end
+        return
+      end
+      if phase == "spin" then
+        if frames < JIGGLYPUFF_STEP then return end
+        frames = 0
+        -- the loop tests the channels after the delay and before the next
+        -- write, so a song that just ended costs no extra quarter turn
+        if not Music.oneShotPlaying() then
+          phase = "tail"
+          return
+        end
+        step = step % #JIGGLYPUFF_SPIN + 1
+        if npc then npc.facing = JIGGLYPUFF_SPIN[step] end
+        return
+      end
+      if frames >= JIGGLYPUFF_TAIL then
+        phase = "done"
+        if require("src.core.GameVersion").isYellow()
+            and require("src.world.PikachuFollower").starterInParty(game.save) then
+          ow.pikachuPewterSleepScene = true
+        end
+      end
+    end,
+  }
+end
+
 M.PEWTER_POKECENTER = {
   talk = {
     TEXT_PEWTERPOKECENTER_JIGGLYPUFF = function(game, ow, npc, done)
-      require("src.core.Music").playOnce(game.data, "Music_JigglypuffSong")
-      push(game, text(game)._PewterPokecenterJigglypuffText
-        or "JIGGLYPUFF: Puu\npupuu!", done)
+      -- not the local push() helper: this box needs opts.auto, which is
+      -- also what suppresses the blinking arrow and the A dismissal
+      local TextBox = require("src.render.TextBox")
+      game.stack:push(TextBox.new(game,
+        text(game)._PewterPokecenterJigglypuffText or "JIGGLYPUFF: Puu\npupuu!",
+        done, { auto = jigglypuffDance(game, npc, ow) }))
     end,
   },
 }
@@ -644,7 +820,8 @@ M.PEWTER_POKECENTER = {
 -- on the west-side cells and walks you back
 local function bikeGateGuard(coords, stopText, explainText)
   return function(game, ow, x, y)
-    if game.save.inventory.BICYCLE then return false end
+    local bike = game.save.inventory.BICYCLE
+    if bike and bike ~= 0 then return false end
     if not inCoords(coords, x, y) then return false end
     -- walk the player up to the tile beside the counter, no further:
     -- (matchedY - closestY) tiles, 0 when already next to it
@@ -659,8 +836,19 @@ local function bikeGateGuard(coords, stopText, explainText)
     local t = text(game)
     push(game, t[stopText] or "Hey! Wait up!", function()
       push(game, t[explainText] or "You need a\nBICYCLE for\nCYCLING ROAD!", function()
+        -- pokered's Route16Gate1FGuardScript / Route18Gate1FGuardScript
+        -- (scripts/Route16Gate1F.asm, Route18Gate1F.asm) simulate one
+        -- PAD_RIGHT step after the refusal text, and only clear
+        -- wJoyIgnore / hand control back once that step finishes
+        -- (PlayerMovingRightScript). Without it the player was left
+        -- parked beside the guard's counter with no way past. #518
+        local function shoveRight()
+          ow:scriptMove(ow.player, "right", 1, nil, { collide = true })
+        end
         if dist > 0 then
-          ow:scriptMove(ow.player, "up", dist)
+          ow:scriptMove(ow.player, "up", dist, shoveRight, { collide = true })
+        else
+          shoveRight()
         end
       end)
     end)
@@ -698,15 +886,30 @@ M.SILPH_CO_7F = {
       { "face_object", 9, "up" },                              -- 4
       { "show_text", "_SilphCo7FRivalWaitedHereText" },        -- 5
       { "rival_battle", "OPP_RIVAL2", 7 },                     -- 6
-      { "jump_if_false", 12 },                                 -- 7
+      { "jump_if_false", 14 },                                 -- 7
       { "set_flag", "EVENT_BEAT_SILPH_CO_RIVAL" },             -- 8
       { "show_text", "_SilphCo7FRivalDefeatedText" },          -- 9
       { "show_text", "_SilphCo7FRivalGoodLuckToYouText" },     -- 10
-      { "move_npc_to", 9, 5, y + 1 },                          -- 11
-      { "hide_object", "SILPH_CO_7F", "SILPHCO7F_RIVAL" },     -- 12
+      { "play_music", "Music_MeetRival", { start = "rival" } }, -- 11
+      { "move_npc_to", 9, 5, y + 1 },                          -- 12
+      { "play_default_music" },                -- scripts/SilphCo7F.asm:261
+      { "hide_object", "SILPH_CO_7F", "SILPHCO7F_RIVAL" },     -- 14
     }, "down")
   end,
 }
+
+-- SSAnne2FRivalAfterBattleScript's exit walk is keyed on the player's X,
+-- not on where the rival stopped: from (37,8) the rival stands below him on
+-- (36,8) and takes .RivalDownFourMovement straight down out of the room;
+-- from (36,8) he stands above him on (36,7) and takes
+-- .RivalWalkAroundPlayerMovement, which steps RIGHT and then falls through
+-- into the same four DOWNs, so five downs in all (#360).
+local function ssAnne2FRivalExitDirs(onLeft)
+  if onLeft then
+    return { "right", "down", "down", "down", "down", "down" }
+  end
+  return { "down", "down", "down", "down" }
+end
 
 -- S.S. Anne 2F rival ambush (scripts/SSAnne2F.asm; coords 36/37,8)
 M.SS_ANNE_2F = {
@@ -719,12 +922,17 @@ M.SS_ANNE_2F = {
       { "move_npc_to", 2, 36, onLeft and 7 or 8 },             -- 2
       { "face_object", 2, onLeft and "down" or "right" },      -- 3
       { "show_text", "_SSAnne2FRivalText" },                   -- 4
-      { "rival_battle", "OPP_RIVAL2", 1 },                     -- 5
-      { "jump_if_false", 10 },                                 -- 6
-      { "set_flag", "EVENT_BEAT_SS_ANNE_RIVAL" },              -- 7
-      { "show_text", "_SSAnne2FRivalDefeatedText" },           -- 8
-      { "move_npc_to", 2, 36, 4 },                             -- 9
-      { "hide_object", "SS_ANNE_2F", "SSANNE2F_RIVAL" },       -- 10
+      -- SSAnne2FRivalText's text_asm arms SaveEndBattleTextPointers
+      -- (scripts/SSAnne2F.asm:199), so the line prints in battle (#1688)
+      { "save_end_battle_text", "_SSAnne2FRivalDefeatedText" }, -- 5
+      { "rival_battle", "OPP_RIVAL2", 1 },                     -- 6
+      { "jump_if_false", 13 },                                 -- 7
+      { "set_flag", "EVENT_BEAT_SS_ANNE_RIVAL" },              -- 8
+      { "show_text", "_SSAnne2FRivalCutMasterText" },          -- 9
+      { "play_music", "Music_MeetRival", { start = "rival" } }, -- 10
+      { "walk_npc", 2, ssAnne2FRivalExitDirs(onLeft) },        -- 11
+      { "play_default_music" },                 -- scripts/SSAnne2F.asm:175
+      { "hide_object", "SS_ANNE_2F", "SSANNE2F_RIVAL" },       -- 13
     }, onLeft and "up" or "left")
   end,
 }

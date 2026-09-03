@@ -12,11 +12,23 @@ local PaletteFX = require("src.render.PaletteFX")
 local Pipelines = require("src.render.Pipelines")
 local PixelCanvas = require("src.render.PixelCanvas")
 local Runtime = require("src.mods.Runtime")
+local GameViewport = require("src.render.GameViewport")
+-- leaf module (no renderer dependency), so requiring it here cannot cycle
+local FaithfulRes = require("src.core.FaithfulRes")
+local ScreenPosition = require("src.core.ScreenPosition")
+local Playfield = require("src.render.Playfield")
 
 local Renderer = {}
 
+-- The Game Boy surface.  WIDTH/HEIGHT are the classic dimensions every
+-- screen is laid out in; uiWidth/uiHeight are the surface actually
+-- allocated this frame, which a state may widen through setUISize (the
+-- widescreen battle layout asks for 304x144).  Anything drawing a normal
+-- 160x144 screen can keep reading WIDTH/HEIGHT.
 Renderer.WIDTH = 160
 Renderer.HEIGHT = 144
+Renderer.MAX_UI_WIDTH = 640
+Renderer.MAX_UI_HEIGHT = 576
 
 -- Whether a value is a real Canvas we can composite.  Real LOVE canvases are
 -- userdata answering typeOf("Canvas"); the headless test stub fakes them as
@@ -25,7 +37,7 @@ Renderer.HEIGHT = 144
 -- would otherwise take the frame down with it.
 local function isCanvas(v)
   if type(v) == "userdata" then
-    return type(v.typeOf) == "function" and v:typeOf("Canvas") == true
+    return type(v.getWidth) == "function" and type(v.getHeight) == "function"
   end
   if type(v) == "table" then
     return type(v.getWidth) == "function" and type(v.getHeight) == "function"
@@ -60,11 +72,9 @@ Renderer.UPRIGHT_MARGIN = 160
 -- Keep separate dpiX/dpiY so each GB pixel covers fitScale() physical pixels
 -- on BOTH axes (square).
 local function displayMetrics()
-  local ww, wh = love.graphics.getDimensions()
+  local ww, wh = GameViewport.dimensions()
   local pw, ph = ww, wh
-  if love.graphics.getPixelDimensions then
-    pw, ph = love.graphics.getPixelDimensions()
-  end
+  pw, ph = GameViewport.pixelDimensions()
   local dpiX, dpiY = 1, 1
   if ww > 0 and pw > 0 then dpiX = pw / ww end
   if wh > 0 and ph > 0 then dpiY = ph / wh end
@@ -76,14 +86,49 @@ local function displayMetrics()
   end
   if dpiX < 1e-6 then dpiX = 1 end
   if dpiY < 1e-6 then dpiY = 1 end
-  return ww, wh, pw, ph, dpiX, dpiY
+  local vx, vy = 0, 0
+  local cut = false
+  local sx, sy, sw, sh = Playfield.cutout(pw, ph)
+  if sx then
+    vx, vy, pw, ph, cut = sx, sy, sw, sh, true
+  end
+  return ww, wh, pw, ph, dpiX, dpiY, vx, vy, cut
 end
+
+local function positionLift(ph, contentPx, dpiY, cut)
+  if cut then return 0 end
+  return ScreenPosition.lift(ph, contentPx, ScreenPosition.safeTop() * dpiY)
+end
+
+-- Free GPU canvases immediately.  Overwriting the Lua reference alone leaves
+-- VRAM allocated until LOVE's GC runs, which is too slow when Android loops
+-- Play → launcher → Play in one process.
+local function releaseCanvas(canvas)
+  if canvas and canvas.release then pcall(canvas.release, canvas) end
+end
+
+function Renderer:releaseCanvases()
+  releaseCanvas(self.canvas); self.canvas = nil
+  releaseCanvas(self.battleHUDCanvas); self.battleHUDCanvas = nil
+  releaseCanvas(self.worldCanvas); self.worldCanvas = nil
+  releaseCanvas(self.uprightCanvas); self.uprightCanvas = nil
+  self.worldActive = false
+  self.uprightActive = false
+  self.worldOverride = nil
+end
+
+Renderer.release = Renderer.releaseCanvases
 
 function Renderer:init()
   -- 160x144 real pixels, never DPI-scaled: see src/render/PixelCanvas.lua
   -- (#208).  Every canvas below is sized in framebuffer pixels for the same
   -- reason -- worldViewSize() already works in drawable pixels.
-  self.canvas = PixelCanvas.new(self.WIDTH, self.HEIGHT, "nearest")
+  -- Release any prior session's surfaces before reallocating (in-process
+  -- return-to-launcher reuses this Renderer singleton).
+  self:releaseCanvases()
+  self.uiWidth, self.uiHeight = self.WIDTH, self.HEIGHT
+  self.canvas = PixelCanvas.new(self.uiWidth, self.uiHeight, "nearest")
+  self.battleHUDCanvas = nil
   self.worldCanvas = nil
   self.worldActive = false
   -- tilt mode only: a transparent overlay canvas the size of the world
@@ -111,11 +156,117 @@ function Renderer:setWorldOverride(canvas)
 end
 
 -- Integer framebuffer pixels per GB pixel that fit the window.  Zoom /
--- GBCFX / callers treat this as the crisp scale; endFrame converts to LOVE
--- units via / dpiX and / dpiY when drawing.
+-- ShaderFX / callers treat this as the crisp scale; endFrame converts to
+-- LOVE units via / dpiX and / dpiY when drawing.
 function Renderer:fitScale()
   local _, _, pw, ph = displayMetrics()
-  return math.max(1, math.floor(math.min(pw / self.WIDTH, ph / self.HEIGHT)))
+  local w, h = self:uiSize()
+  local s = math.max(1, math.floor(math.min(pw / w, ph / h)))
+  -- FAITHFUL RATIO on mobile locks the scale here rather than by resizing the
+  -- window, which a phone does not have (see src/core/FaithfulRes.lua).  The
+  -- cap is the largest WHOLE multiple the display holds, so the picture is as
+  -- big as exact pixels allow and the remainder is bars.  Computed per frame
+  -- off the live drawable size, so a rotate re-derives it with nothing to
+  -- re-apply.
+  local cap = FaithfulRes.scaleCap()
+  if cap and cap < s then s = cap end
+  return s
+end
+
+-- Integer framebuffer pixels per GB pixel for the UI pass.
+--
+-- Survey zoom only ever scaled the world: the UI kept blitting at fitScale,
+-- so zooming out left a full-size dialogue box over a shrunken world, which
+-- reads as the UI growing.  Stepping the UI down with the zoom keeps the two
+-- in proportion.  Whole integers only, so a UI pixel stays a whole number of
+-- screen pixels and the font does not resample; and never below half of
+-- fitScale, because past that the text stops being readable.
+--
+-- Zooming IN does not scale the UI up -- a dialogue box larger than the
+-- classic one has no reference to be faithful to, and the letterbox it sits
+-- in does not grow either.
+function Renderer:uiScale()
+  local S = self:fitScale()
+  local off = Zoom.offset or 0
+  -- UI LAYOUT = CENTERED (uiCentered, set per frame by Game:draw): the UI is
+  -- a fixed letterbox at the fit scale and does not follow the survey zoom at
+  -- all, which is the whole point of the setting -- the screen furniture
+  -- stays put instead of resizing under the player.  DYNAMIC keeps the
+  -- step-down below.  BATTLE SIZE is unaffected either way: uiFill overrides
+  -- the scale in endFrame, after this.
+  if self.uiCentered then return S end
+  -- Only follow the zoom when a world is actually behind the UI.  Survey zoom
+  -- is an OVERWORLD control; the title screen, the intro and the credits show
+  -- no world at all, and shrinking them to match a zoom level the player set
+  -- for the map is meaningless.  worldActive is this frame's answer --
+  -- beginFrame clears it and beginWorldPass sets it -- so a state that draws
+  -- no world keeps the full fit scale.
+  --
+  -- uiWorldHold (Game:draw) is the case worldActive cannot answer: a BATTLE
+  -- BG "world" battle stays the scene's backdrop while an OPAQUE state -- the
+  -- party menu, the bag -- covers it, whether or not a world pass ran under
+  -- that state.  Reading worldActive alone drops the step-down there and
+  -- blits those menus a whole scale larger than the battle they cover.
+  -- Game.drawBaseInStack keeps the map drawing in the common case, so the two
+  -- normally agree; this holds the scale even when it cannot (a battle with
+  -- something other than the overworld beneath it).
+  if not (self.worldActive or self.uiWorldHold) then return S end
+  if off >= 0 then return S end
+  local floorS = math.ceil(S / 2) -- at most a 50% reduction
+  local s = S + off               -- one integer step per zoom-out step
+  if s < floorS then s = floorS end
+  return math.max(1, s)
+end
+
+-- the native-pixel UI surface in use right now
+function Renderer:uiSize()
+  return self.uiWidth or self.WIDTH, self.uiHeight or self.HEIGHT
+end
+
+-- Ask for a UI surface of w x h native pixels; the canvas is reallocated
+-- only when the size actually changes, so the classic path never rebuilds
+-- it.  Sizes are resolved before any state draws (Game:draw) and bounded on
+-- both ends -- never smaller than the Game Boy screen every layout assumes,
+-- never large enough for a bad request to allocate an unbounded canvas.
+function Renderer:setUISize(w, h)
+  if type(w) ~= "number" or type(h) ~= "number"
+     or w < self.WIDTH or h < self.HEIGHT
+     or w > self.MAX_UI_WIDTH or h > self.MAX_UI_HEIGHT then
+    w, h = self.WIDTH, self.HEIGHT
+  end
+  w, h = math.floor(w), math.floor(h)
+  if w == self.uiWidth and h == self.uiHeight and self.canvas then return end
+  if self.canvas and self.canvas.release then self.canvas:release() end
+  if self.battleHUDCanvas and self.battleHUDCanvas.release then
+    self.battleHUDCanvas:release()
+  end
+  self.battleHUDCanvas = nil
+  self.uiWidth, self.uiHeight = w, h
+  self.canvas = PixelCanvas.new(w, h, "nearest")
+end
+
+-- Transparent native-pixel surface for an extended WIDE battle HUD. The
+-- battle scene remains in `canvas`; endFrame places registered HUD regions
+-- afterward in physical-window space.
+function Renderer:beginBattleHUDPass()
+  local w, h = self:uiSize()
+  if not self.battleHUDCanvas
+     or self.battleHUDCanvas:getWidth() ~= w
+     or self.battleHUDCanvas:getHeight() ~= h then
+    if self.battleHUDCanvas and self.battleHUDCanvas.release then
+      self.battleHUDCanvas:release()
+    end
+    self.battleHUDCanvas = PixelCanvas.new(w, h, "nearest")
+  end
+  local previous = love.graphics.getCanvas and love.graphics.getCanvas()
+                   or self.canvas
+  love.graphics.setCanvas(self.battleHUDCanvas)
+  love.graphics.clear(0, 0, 0, 0)
+  return previous
+end
+
+function Renderer:endBattleHUDPass(previous)
+  love.graphics.setCanvas(previous or self.canvas)
 end
 
 -- LOVE-unit draw scales endFrame uses for the UI blit: integer framebuffer
@@ -146,13 +297,32 @@ end
 -- corners; flat mode returns exactly today's size (growth factor is 1 when
 -- tilt is inactive).
 function Renderer:worldViewSize()
-  local _, _, pw, ph = displayMetrics()
+  local _, _, pw, ph, _, dpiY, _, _, cut = displayMetrics()
+  -- FAITHFUL RATIO on mobile.  The world pass deliberately expands to cover the
+  -- WHOLE display, so letterbox voids become more map instead of black bars.
+  -- That is why the lock appeared to do nothing in the overworld: it shrank
+  -- the UI blit while the map kept filling the screen -- and showed MORE of
+  -- the map, because a smaller scale fits more world pixels in.
+  --
+  -- Size the view against the LOCKED VIEWPORT rather than the display.  A
+  -- desktop lock gets this for free by making the window exactly 160N x 144N;
+  -- this is the same sum with the viewport standing in for the window, so
+  -- both platforms show the same map area at the same zoom.
+  local cap = FaithfulRes.scaleCap()
+  if cap then
+    local uiw, uih = self:uiSize()
+    pw = cut and math.min(pw, uiw * cap) or uiw * cap
+    ph = cut and math.min(ph, uih * cap) or uih * cap
+  end
   local sp = Zoom.scale(self:fitScale())
   local vw, vh = math.ceil(pw / sp), math.ceil(ph / sp)
   -- Even sizes keep Camera:follow on integer pixels (viewW/2 is integral),
   -- so unfloored FX/sprite math cannot phase-shimmer against the tile layer.
   if vw % 2 ~= 0 then vw = vw + 1 end
   if vh % 2 ~= 0 then vh = vh + 1 end
+  local _, uih = self:uiSize()
+  local lift = positionLift(ph, uih * self:fitScale(), dpiY, cut)
+  if lift > 0 then vh = vh + 2 * math.ceil(lift / sp) end
   if Tilt.active() then
     local g = Tilt.viewGrowth()
     vw, vh = math.ceil(vw * g), math.ceil(vh * g)
@@ -162,18 +332,32 @@ end
 
 -- transparent: the world pass shows through (UI pass draws overlays only)
 function Renderer:beginFrame(transparent)
+  self.uiOpaque = not transparent
   self.worldActive = false
   self.uprightActive = false
   self.worldOverride = nil
   -- warp-fade overlay from Transition (issue #121); cleared each frame so
   -- a popped transition cannot leave a sticky black veil
   self.worldFadeAlpha = nil
-  -- battle-transition cascade outside the 160x144 wipe (BattleTransition)
-  self.battleCascadeProg = nil
+  self.worldFadeColor = nil
+  -- battle-transition wipe, drawn over the whole surface (BattleTransition)
+  self.battleWipe = nil
+  -- engine/battle/battle_transitions.asm:28
+  self.wipeSprites = nil
+  self.wipeWox, self.wipeWoy, self.wipeSx, self.wipeSy = nil, nil, nil, nil
+  -- whole-surface veil in screen space (battle-transition flash, the
+  -- fade in from white after a battle) -- covers the window, not just the
+  -- 160x144 letterbox
+  self.screenVeil = nil
+  -- edge-anchored UI regions, re-declared by their elements each frame
+  self.uiAnchors = nil
   -- last frame's trueColor rects and sprite redraws go before anything
   -- draws this one
   PaletteFX.clearTrueColor()
   PaletteFX.clearSpriteRedraws()
+  -- rBGP is a per-frame register here: the state that draws a dark map
+  -- re-arms it while it draws (#322), so nothing inherits last frame's
+  PaletteFX.setShadeMap(nil)
   PaletteFX.setPass("ui")
   love.graphics.setCanvas(self.canvas)
   if transparent then
@@ -183,44 +367,95 @@ function Renderer:beginFrame(transparent)
   end
 end
 
--- Black 8x8 (scaled) blocks cascading outward from the classic GB letterbox
--- into the surrounding window, matching BattleTransition wipe progress.
--- Tiles that sit entirely inside the 160x144 square are left to the OG wipe.
+-- The battle-transition wipe, drawn once over the WHOLE surface in screen
+-- space rather than as a 160x144 wipe plus a separate fill around it.
+--
+-- The tile grid is anchored on the letterbox and extended outward at the same
+-- tile size, so the figure is continuous: a spiral begins at the outermost
+-- edge of the window and works inward through the letterbox to the middle.
+-- Nothing is stretched -- the pattern is continued with more tiles, not
+-- scaled-up pixels -- and at 1x the grid works out to exactly 20x18, where
+-- BattleTransition.gridOrder hands back the ROM's own walk, so an unzoomed
+-- window is the classic wipe unchanged.
+--
 -- Sx/Sy are LOVE-unit scales (Sy defaults to Sx on uniform surfaces).
-function Renderer:drawBattleCascade(prog, ww, wh, ox, oy, vpw, vph, Sx, Sy)
-  if not prog or prog <= 0 then return end
+function Renderer:drawBattleWipe(wipe, ww, wh, ox, oy, vpw, vph, Sx, Sy, wx, wy)
+  if not wipe or not wipe.prog or wipe.prog <= 0 then return end
   Sy = Sy or Sx
-  local TILE_W, TILE_H = 8 * Sx, 8 * Sy
-  if TILE_W < 1 then TILE_W = 1 end
-  if TILE_H < 1 then TILE_H = 1 end
-  local cols = math.ceil(ww / TILE_W)
-  local rows = math.ceil(wh / TILE_H)
-  local cx, cy = ox + vpw / 2, oy + vph / 2
-  local order = {}
-  for row = 0, rows - 1 do
-    for col = 0, cols - 1 do
-      local x, y = col * TILE_W, row * TILE_H
-      -- any tile with area outside the letterbox participates
-      if x < ox or y < oy or x + TILE_W > ox + vpw or y + TILE_H > oy + vph then
-        local dist = math.max(math.abs(x + TILE_W / 2 - cx),
-                              math.abs(y + TILE_H / 2 - cy))
-        order[#order + 1] = { x, y, dist }
-      end
-    end
-  end
-  if #order == 0 then return end
-  table.sort(order, function(a, b)
-    if a[3] ~= b[3] then return a[3] < b[3] end
-    if a[2] ~= b[2] then return a[2] < b[2] end
-    return a[1] < b[1]
-  end)
-  local n = math.floor(#order * math.min(1, prog) + 1e-6)
-  if prog >= 1 then n = #order end
+  wx, wy = wx or 0, wy or 0
+  local TW, TH = 8 * Sx, 8 * Sy
+  if TW < 1 then TW = 1 end
+  if TH < 1 then TH = 1 end
+  local prog = math.min(1, wipe.prog)
+
   love.graphics.setColor(0, 0, 0, 1)
-  love.graphics.setScissor(0, 0, ww, wh)
-  for i = 1, n do
-    local t = order[i]
-    love.graphics.rectangle("fill", t[1], t[2], TILE_W, TILE_H)
+  love.graphics.setScissor(wx, wy, ww, wh)
+
+  if prog >= 1 then
+    love.graphics.rectangle("fill", wx, wy, ww, wh)
+    love.graphics.setScissor()
+    love.graphics.setColor(1, 1, 1, 1)
+    return
+  end
+
+  -- whole-tile padding out to each window edge, keeping the grid in phase
+  -- with the letterbox's tiles
+  local padL = math.max(0, math.ceil((ox - wx) / TW))
+  local padT = math.max(0, math.ceil((oy - wy) / TH))
+  local padR = math.max(0, math.ceil((wx + ww - ox - vpw) / TW))
+  local padB = math.max(0, math.ceil((wy + wh - oy - vph) / TH))
+  local lbCols = math.max(1, math.floor(vpw / TW + 0.5))
+  local lbRows = math.max(1, math.floor(vph / TH + 0.5))
+  local cols, rows = padL + lbCols + padR, padT + lbRows + padB
+  local x0, y0 = ox - padL * TW, oy - padT * TH
+
+  -- required here rather than at the top: BattleTransition reaches the
+  -- renderer through game.renderer at draw time, and a module-level require
+  -- would put the two files in a load cycle
+  local BattleTransition = require("src.render.BattleTransition")
+  local order = BattleTransition.gridOrder(wipe.style, cols, rows)
+
+  if order then
+    local n = math.floor(#order * prog + 1e-6)
+    for i = 1, n do
+      local t = order[i]
+      love.graphics.rectangle("fill", x0 + t[1] * TW, y0 + t[2] * TH, TW, TH)
+    end
+  else
+    -- shrink / split / the stripes are geometry, not a walk: the same shapes
+    -- measured against the window instead of the letterbox
+    local style = wipe.style
+    if style == "hstripes" then
+      local w = ww * prog
+      for row = 0, rows - 1 do
+        local y = y0 + row * TH
+        if row % 2 == 0 then
+          love.graphics.rectangle("fill", wx, y, w, TH)
+        else
+          love.graphics.rectangle("fill", wx + ww - w, y, w, TH)
+        end
+      end
+    elseif style == "vstripes" then
+      local h = wh * prog
+      for col = 0, cols - 1 do
+        local x = x0 + col * TW
+        if col % 2 == 0 then
+          love.graphics.rectangle("fill", x, wy, TW, h)
+        else
+          love.graphics.rectangle("fill", x, wy + wh - h, TW, h)
+        end
+      end
+    elseif style == "shrink" then
+      local h, w = wh / 2 * prog, ww / 2 * prog
+      love.graphics.rectangle("fill", wx, wy, ww, h)
+      love.graphics.rectangle("fill", wx, wy + wh - h, ww, h)
+      love.graphics.rectangle("fill", wx, wy, w, wh)
+      love.graphics.rectangle("fill", wx + ww - w, wy, w, wh)
+    else -- split: a black cross growing out of the centre in both axes
+      local h, w = wh / 2 * prog, ww / 2 * prog
+      love.graphics.rectangle("fill", wx, wy + wh / 2 - h, ww, h * 2)
+      love.graphics.rectangle("fill", wx + ww / 2 - w, wy, w * 2, wh)
+    end
   end
   love.graphics.setScissor()
   love.graphics.setColor(1, 1, 1, 1)
@@ -341,7 +576,8 @@ end
 -- into (nil = default framebuffer; presentCanvas when CRT is on).
 -- Returns true on success; false (no shader/mesh) tells endFrame to fall
 -- back to the flat blit unchanged.
-function Renderer:drawTiltedWorld(zoneList, sx, sy, wox, woy, target)
+function Renderer:drawTiltedWorld(zoneList, sx, sy, wox, woy, target,
+                                 boxX, boxY, boxW, boxH)
   local shader = self:tiltShader()
   local mesh = self:tiltMesh()
   if not (shader and mesh) then return false end
@@ -365,7 +601,7 @@ function Renderer:drawTiltedWorld(zoneList, sx, sy, wox, woy, target)
   local zoneShader = zoneList and zoneList[1] and PaletteFX.shader() or nil
   if zoneShader then
     love.graphics.setShader(zoneShader)
-    -- same trueColor sentinel the flat blit honors (14 §trueColor)
+    -- same trueColor sentinel the flat blit below honors
     local bare = false
     for _, z in ipairs(zoneList) do
       local plain = z.colors == false
@@ -392,22 +628,49 @@ function Renderer:drawTiltedWorld(zoneList, sx, sy, wox, woy, target)
   mesh:setTexture(self.tiltCanvas)
   mesh:setVertices(Tilt.meshCorners(wvw, wvh))
   love.graphics.push()
+  if boxW and boxH and boxW > 0 and boxH > 0 then
+    love.graphics.setScissor(boxX, boxY, boxW, boxH)
+  end
   love.graphics.translate(wox, woy)
   love.graphics.scale(sx, sy)
   love.graphics.setColor(1, 1, 1, 1)
   love.graphics.setShader(shader)
   love.graphics.draw(mesh)
   love.graphics.setShader()
+  love.graphics.setScissor()
   love.graphics.pop()
   return true
 end
 
--- clamp a scissor rect to the viewport box
-local function scissorClamped(x, y, w, h, ox, oy, vpw, vph)
+-- LÖVE 11 truncates scissor arguments to framebuffer pixels; the half-pixel
+-- bias keeps values divided back through a fractional DPI scale from landing
+-- one short.  LÖVE 12 passes fractional arguments through and rounds in the
+-- graphics backend instead, where that bias shifts each origin by one pixel
+-- and extends its far edge by two (#673).
+local SCISSOR_PIXEL_BIAS = 0.5
+if love and love.getVersion and select(1, love.getVersion()) >= 12 then
+  SCISSOR_PIXEL_BIAS = 0
+end
+
+-- Clamp a scissor rect to the viewport box, then round it outward to whole
+-- framebuffer pixels.  On LÖVE 11, x, y, w and h are truncated independently,
+-- so a rect with fractional unit edges (Android's non-integer DPI puts
+-- fitScale/dpi in Sx/Sy) loses up to a pixel per side and two adjacent SGB
+-- zones stop sharing an edge: the letterbox clear shows through as a seam at
+-- every zone boundary (#373).  Rounding outward makes neighbours overlap by
+-- at most one row instead; SCISSOR_PIXEL_BIAS preserves that result across the
+-- LÖVE 11 and 12 conversion rules.
+local function scissorClamped(x, y, w, h, ox, oy, vpw, vph, dpiX, dpiY)
   local x2, y2 = math.min(x + w, ox + vpw), math.min(y + h, oy + vph)
   x, y = math.max(x, ox), math.max(y, oy)
   if x2 <= x or y2 <= y then return false end
-  love.graphics.setScissor(x, y, x2 - x, y2 - y)
+  dpiX, dpiY = dpiX or 1, dpiY or 1
+  local px1, py1 = math.floor(x * dpiX), math.floor(y * dpiY)
+  local px2, py2 = math.ceil(x2 * dpiX), math.ceil(y2 * dpiY)
+  local b = SCISSOR_PIXEL_BIAS
+  love.graphics.setScissor((px1 + b) / dpiX, (py1 + b) / dpiY,
+                           (px2 - px1 + b) / dpiX,
+                           (py2 - py1 + b) / dpiY)
   return true
 end
 
@@ -417,6 +680,7 @@ end
 -- or empty zone list is left alone: that already draws the whole canvas
 -- unshaded, which is what the rects were asking for.
 local function withTrueColor(zoneList, pass)
+  if not PaletteFX.honorsTrueColor() then return zoneList end
   local rects = PaletteFX.trueColorRects(pass)
   if not (rects[1] and zoneList and zoneList[1]) then return zoneList end
   local merged = {}
@@ -425,26 +689,188 @@ local function withTrueColor(zoneList, pass)
   return merged
 end
 
+-- Palette-correct blit of `canvas` at (sx, sy) LOVE-unit scales into origin
+-- (bx, by), scissored to the (boxX, boxY, boxW, boxH) screen rect.  zoneSx/
+-- zoneSy convert zone coords (canvas-space) into screen units.  Public so a
+-- render.compose mod can composite the world/UI canvases into its own layout.
+function Renderer:blitCanvas(canvas, sx, sy, zoneList, zoneSx, zoneSy,
+                             bx, by, boxX, boxY, boxW, boxH, dpiX, dpiY)
+  local shader = zoneList and zoneList[1] and PaletteFX.shader() or nil
+  if not shader then
+    love.graphics.setScissor(boxX, boxY, boxW, boxH)
+    love.graphics.draw(canvas, bx, by, 0, sx, sy)
+    love.graphics.setScissor()
+    return
+  end
+  love.graphics.setShader(shader)
+  -- data/sgb/sgb_packets.asm:123-127: zone 1 is the whole-screen ATTR_BLK,
+  -- so the underpaint is only drawn when it leaves part of the box bare (#1866)
+  local first = zoneList[1]
+  if canvas == self.canvas and self.uiOpaque and first.colors
+      and not (bx + first.x * zoneSx <= boxX
+               and by + first.y * zoneSy <= boxY
+               and bx + (first.x + first.w) * zoneSx >= boxX + boxW
+               and by + (first.y + first.h) * zoneSy >= boxY + boxH) then
+    PaletteFX.sendColors(shader, first.colors)
+    love.graphics.setScissor(boxX, boxY, boxW, boxH)
+    love.graphics.draw(canvas, bx, by, 0, sx, sy)
+  end
+  -- a colors == false zone is the trueColor opt-out: its rect draws with
+  -- no shader at all.  Nothing sets one without a mod, so a vanilla zone
+  -- list never toggles and issues exactly the calls it always did.
+  local bare = false
+  for _, z in ipairs(zoneList) do
+    local plain = z.colors == false
+    if plain ~= bare then
+      bare = plain
+      love.graphics.setShader(not plain and shader or nil)
+    end
+    if not plain then PaletteFX.sendColors(shader, z.colors) end
+    if scissorClamped(bx + z.x * zoneSx, by + z.y * zoneSy,
+                      z.w * zoneSx, z.h * zoneSy,
+                      boxX, boxY, boxW, boxH, dpiX, dpiY) then
+      love.graphics.draw(canvas, bx, by, 0, sx, sy)
+    end
+  end
+  love.graphics.setScissor()
+  love.graphics.setShader()
+end
+
+-- Take a rect out of a list of rects, splitting each overlapped one into up
+-- to four pieces.  Used to vacate an anchored UI region from the letterbox
+-- blit, so the element is drawn at its anchor and not also in place.
+local function subtractRect(list, x, y, w, h)
+  local out = {}
+  local x2, y2 = x + w, y + h
+  for _, r in ipairs(list) do
+    local rx, ry, rw, rh = r[1], r[2], r[3], r[4]
+    local rx2, ry2 = rx + rw, ry + rh
+    if x2 <= rx or x >= rx2 or y2 <= ry or y >= ry2 then
+      out[#out + 1] = r -- disjoint
+    else
+      if ry < y then out[#out + 1] = { rx, ry, rw, y - ry } end
+      if y2 < ry2 then out[#out + 1] = { rx, y2, rw, ry2 - y2 } end
+      local ty, ty2 = math.max(ry, y), math.min(ry2, y2)
+      if rx < x then out[#out + 1] = { rx, ty, x - rx, ty2 - ty } end
+      if x2 < rx2 then out[#out + 1] = { x2, ty, rx2 - x2, ty2 - ty } end
+    end
+  end
+  return out
+end
+
+-- A UI element that should sit against a screen edge rather than inside the
+-- centred letterbox.  Declared during the element's own draw, in UI-canvas
+-- pixels, and consumed by endFrame this frame only.
+--   anchor: "bottom" | "topright" | "topleft" | "bottomright"
+local function addUIAnchor(renderer, x, y, w, h, anchor, windowClamped,
+                           canvas, extract)
+  renderer.uiAnchors = renderer.uiAnchors or {}
+  renderer.uiAnchors[#renderer.uiAnchors + 1] = {
+    x = x, y = y, w = w, h = h, anchor = anchor,
+    windowClamped = windowClamped and true or false,
+    canvas = canvas,
+    extract = extract ~= false,
+  }
+end
+
+function Renderer:setUIAnchor(x, y, w, h, anchor)
+  -- UI LAYOUT = CENTERED (uiCentered, set per frame by Game:draw from
+  -- save.options.uiLayout): every element stays where it was drawn in the
+  -- 160x144 canvas and the letterbox centres the lot, which is how the port
+  -- behaved before edge docking existed.  This is the DEFAULT; DYNAMIC opts
+  -- back into docking.  Gating here rather than at each caller means one
+  -- switch covers the dialogue box, its YES/NO, the START menu and anything
+  -- added later, and none of them has to know the option exists.
+  if self.uiCentered then return end
+  -- uiAnchorHold (Game:draw): a state that composes its own screen -- a
+  -- battle -- keeps every element inside it, so the box blits where it was
+  -- drawn in the canvas instead of being pulled to the window edge.
+  if self.uiAnchorHold then return end
+  addUIAnchor(self, x, y, w, h, anchor, false, self.canvas, true)
+end
+
+-- Battle-owned window-space placement. Unlike ordinary UI anchors this is
+-- intentionally allowed while BattleState holds general dialogue/menu
+-- anchors inside the battle surface. Callers must gate it to an explicit
+-- battle HUD mode.
+function Renderer:setBattleUIAnchor(x, y, w, h, anchor)
+  addUIAnchor(self, x, y, w, h, anchor, true,
+              self.battleHUDCanvas or self.canvas, false)
+end
+
 -- zones: optional list of SGB palette regions (see PaletteFX) in
 -- 160x144 UI space, applied to the UI pass.  worldZones: optional
 -- regions in world-canvas pixels (overworld survey zoom colors each
 -- visible map area separately), applied to the world pass; the world
 -- pass falls back to the UI zones when absent.  Each zone is drawn
 -- scissored through the shade-remap shader, later zones on top.
--- When GBC FX is active the composite is drawn into presentCanvas and
--- presented through the GBC FX shader as a final pass.
-function Renderer:endFrame(zones, worldZones)
-  love.graphics.setCanvas()
-  local ww, wh, pw, ph, dpiX, dpiY = displayMetrics()
+-- When ShaderFX is active the composite is drawn into presentCanvas and
+-- presented through the shader chain as a final pass.
+function Renderer:frameRects()
+  local ww, wh, pw, ph, dpiX, dpiY, vx, vy, cut = displayMetrics()
+  local r = {
+    ww = ww, wh = wh, pw = pw, ph = ph, dpiX = dpiX, dpiY = dpiY,
+    vx = vx, vy = vy, cut = cut,
+    vux = vx / dpiX, vuy = vy / dpiY, vuw = pw / dpiX, vuh = ph / dpiY,
+  }
   -- Sp = integer framebuffer pixels per GB pixel;
   -- Sx/Sy = LOVE-unit draw scales (may differ when dpiX ≠ dpiY).
   local Sp = self:fitScale()
-  local Sx, Sy = Sp / dpiX, Sp / dpiY
-  local vpw, vph = self.WIDTH * Sx, self.HEIGHT * Sy
+  r.Sp, r.Sx, r.Sy = Sp, Sp / dpiX, Sp / dpiY
+  local uiw, uih = self:uiSize()
+  r.uiw, r.uih = uiw, uih
+  r.vpw, r.vph = uiw * r.Sx, uih * r.Sy
   -- Snap the letterbox origin to a framebuffer pixel, then convert to units.
-  local ox = math.floor((pw - self.WIDTH * Sp) / 2) / dpiX
-  local oy = math.floor((ph - self.HEIGHT * Sp) / 2) / dpiY
-  local GBCFX = require("src.render.GBCFX")
+  r.lift = positionLift(ph, uih * Sp, dpiY, cut)
+  r.ox = (vx + math.floor((pw - uiw * Sp) / 2)) / dpiX
+  r.oy = (vy + math.floor((ph - uih * Sp) / 2) - r.lift) / dpiY
+  -- The UI has its own scale: it steps down as the survey zoom goes out (see
+  -- uiScale), so it can be smaller than the world letterbox.  Un-zoomed these
+  -- are identical to Sp/ox/oy and every rect below is what it always was.
+  local Up = self:uiScale()
+  -- BATTLE SIZE "fill" (Renderer.uiFill, set per frame by Game:draw): scale
+  -- the surface to the window rather than to whole GB pixels, so the battle
+  -- fills vertically at any zoom or window size.  Fractional by nature -- a
+  -- GB pixel stops being a whole number of screen pixels, which is the trade
+  -- the setting exists to offer.  Clamped on the horizontal too, so a narrow
+  -- window scales to fit instead of overflowing off both sides.
+  if self.uiFill and not FaithfulRes.scaleCap() then
+    Up = math.min(ph / uih, pw / uiw)
+  end
+  if uiw * Up > pw or uih * Up > ph then
+    Up = math.min(ph / uih, pw / uiw)
+  end
+  r.Up, r.Ux, r.Uy = Up, Up / dpiX, Up / dpiY
+  r.uvpw, r.uvph = uiw * r.Ux, uih * r.Uy
+  r.uox = (vx + math.floor((pw - uiw * Up) / 2)) / dpiX
+  r.uoy = (vy + math.max(0, math.floor((ph - uih * Up) / 2) - r.lift)) / dpiY
+  return r
+end
+
+function Renderer.clipToView(r, x, y, w, h)
+  local x2, y2 = math.min(x + w, r.vux + r.vuw), math.min(y + h, r.vuy + r.vuh)
+  x, y = math.max(x, r.vux), math.max(y, r.vuy)
+  return x, y, math.max(0, x2 - x), math.max(0, y2 - y)
+end
+
+function Renderer:playfieldRect()
+  local r = self:frameRects()
+  return r.vux, r.vuy, r.vuw, r.vuh, r.cut
+end
+
+function Renderer:endFrame(zones, worldZones)
+  GameViewport.setTarget()
+  local R = self:frameRects()
+  local ww, wh, pw, ph = R.ww, R.wh, R.pw, R.ph
+  local dpiX, dpiY, vx, vy, cut = R.dpiX, R.dpiY, R.vx, R.vy, R.cut
+  local vux, vuy, vuw, vuh = R.vux, R.vuy, R.vuw, R.vuh
+  local Sp, Sx, Sy = R.Sp, R.Sx, R.Sy
+  local uiw, uih = R.uiw, R.uih
+  local vpw, vph, ox, oy = R.vpw, R.vph, R.ox, R.oy
+  local Ux, Uy = R.Ux, R.Uy
+  local uvpw, uvph, uox, uoy = R.uvpw, R.uvph, R.uox, R.uoy
+  local Up = R.Up
+  local ShaderFX = require("src.render.ShaderFX")
   -- Forced mono/Classic modes still need a whole-screen zone when a state
   -- exposes no SGB packets (raw DMG canvas), so sendColors can remap.
   zones = PaletteFX.ensureZones(zones)
@@ -456,11 +882,43 @@ function Renderer:endFrame(zones, worldZones)
   zones = withTrueColor(zones, "ui")
   worldZones = withTrueColor(worldZones, "world")
 
-  -- A post-process pipeline needs the whole composite in a canvas for the
-  -- same reason GBC FX does, so either one alone is enough to take the
-  -- present path; with neither, the frame draws straight to the screen
-  -- exactly as it always did.
-  local needPresent = GBCFX.active() or Pipelines.wantsPresent()
+  -- render.compose: hand a mod the finished world + UI canvases (and their
+  -- SGB zones), the frame metrics, Renderer:blitCanvas and the SecondScreen
+  -- bridge, letting it lay the two passes out however it likes -- e.g. as two
+  -- stacked Game Boy screens, or driving one onto a second physical display.
+  -- The mod returns true to take over the whole window; anything else (or no
+  -- mod wrapping the hook) falls through to the normal composite below.
+  if Runtime.wantsHook("render.compose") then
+    local ctx = {
+      renderer = self,
+      worldCanvas = self.worldCanvas, uiCanvas = self.canvas,
+      worldOverride = self.worldOverride,
+      worldActive = self.worldActive and true or false,
+      zones = zones, worldZones = worldZones,
+      ww = ww, wh = wh, pw = pw, ph = ph, ox = ox, oy = oy,
+      vpw = vpw, vph = vph, uiw = uiw, uih = uih,
+      scale = Sp, Sx = Sx, Sy = Sy, dpiX = dpiX, dpiY = dpiY,
+      viewX = vux, viewY = vuy, viewWidth = vuw, viewHeight = vuh,
+      secondScreen = require("src.render.SecondScreen"),
+    }
+    if Runtime.call("render.compose", function() return false end, self, ctx) == true then
+      self.worldActive = false
+      self.uprightActive = false
+      self.worldOverride = nil
+      PaletteFX.setPass(nil)
+      return {
+        width = ww, height = wh, gameX = ox, gameY = oy,
+        gameWidth = vpw, gameHeight = vph, scale = Sp, dpiX = dpiX, dpiY = dpiY,
+      }
+    end
+  end
+
+  -- Post-process pipelines, ShaderFX and an enabled final-output owner need the
+  -- whole composite in a canvas. With none of them, the frame draws straight
+  -- to the screen exactly as it always did.
+  local hasOutputHook = Runtime.wantsHook("render.output")
+    and Runtime.call("render.output_enabled", function() return false end) == true
+  local needPresent = ShaderFX.active() or Pipelines.wantsPresent() or hasOutputHook
   local present = nil
   if needPresent then
     if not self.presentCanvas or self.presentCanvas:getWidth() ~= ww
@@ -480,66 +938,104 @@ function Renderer:endFrame(zones, worldZones)
     love.graphics.setCanvas(present)
   end
   -- Default letterbox is black.  Battle (and any state that opts in via
-  -- letterboxWhite) fills the voids white so the window matches the
-  -- white battle canvas instead of showing black bars.
+  -- letterboxWhite) fills the voids with the display mode's paper shade, so
+  -- the bars match the canvas they frame instead of showing black.  Not a
+  -- literal white: the battle canvas is colorized, and in SGB mode its paper
+  -- is the pack's off-white (255,239,255), which a hardcoded 1,1,1 framed in
+  -- a visibly brighter border.
   local clearR, clearG, clearB = 0, 0, 0
+  local extendedBlackBand = false
+  local bandR, bandG, bandB = 1, 1, 1
   if not self.worldActive then
     local ok, Game = pcall(require, "src.core.Game")
     local stack = ok and Game and Game.stack
     local base = stack and stack.visibleBase and stack:visibleBase()
     local state = base and stack.states and stack.states[base]
-    if state and state.letterboxWhite then
-      clearR, clearG, clearB = 1, 1, 1
+    -- A battle owns the surround it established until it leaves the stack.
+    -- Reading it off visibleBase alone loses that the moment the battle opens
+    -- an OPAQUE state -- the party menu, the bag -- because that state becomes
+    -- the base and answers no to letterboxWhite, flipping a white battle
+    -- surround to flat black for as long as the menu is up.  Same whole-stack
+    -- hold as uiFill and the dim.
+    for i = #(stack and stack.states or {}), 1, -1 do
+      local s = stack.states[i]
+      if s and s.letterboxWhite then
+        state = s
+        break
+      end
+    end
+    -- BATTLE BG "black" keeps the default black clear; "white" (and any
+    -- non-battle state that opts in) uses the paper shade.  "world" never
+    -- reaches here -- it makes the battle non-opaque, so the world pass is
+    -- active and this whole branch is skipped.
+    -- FAITHFUL RATIO's mobile lock promises the display outside the GB
+    -- screen stays black (src/core/FaithfulRes.lua); the paper surround
+    -- painted the whole phone white on New Game and in battle (#864), so
+    -- the lock keeps the default black bars.
+    if state and state.extendedBlackHUD and state:extendedBlackHUD()
+       and not FaithfulRes.scaleCap() then
+      -- Extended/Black keeps the author's black surround, but extends the
+      -- fixed battle's paper field vertically through the physical window.
+      -- The band uses the exact centred fixed-width composition bounds, so
+      -- only vertical black bars remain at the sides.
+      extendedBlackBand = true
+      bandR, bandG, bandB = PaletteFX.paperShade(Game and Game.data)
+    elseif state and state.letterboxWhite
+       and not (state.bgMode and state:bgMode() == "black")
+       and not FaithfulRes.scaleCap() then
+      clearR, clearG, clearB = PaletteFX.paperShade(Game and Game.data)
+    end
+    -- UI LETTERBOX overrides whatever the rules above settled on, except
+    -- under FAITHFUL RATIO's mobile lock, which promises black bars.
+    if not FaithfulRes.scaleCap() then
+      local Letterbox = require("src.render.Letterbox")
+      clearR, clearG, clearB = Letterbox.fill(clearR, clearG, clearB,
+        function() return PaletteFX.paperShade(Game and Game.data) end)
     end
   end
+  if cut then
+    love.graphics.setColor(0, 0, 0, 1)
+    love.graphics.rectangle("fill", 0, 0, ww, wh)
+  end
   love.graphics.setColor(clearR, clearG, clearB, 1)
-  love.graphics.rectangle("fill", 0, 0, ww, wh)
+  love.graphics.rectangle("fill", vux, vuy, vuw, vuh)
+  if extendedBlackBand then
+    love.graphics.setColor(bandR, bandG, bandB, 1)
+    love.graphics.rectangle("fill", uox, vuy, uvpw, vuh)
+  end
   love.graphics.setColor(1, 1, 1, 1)
   -- render.letterbox: SGB borders / custom void art in the bars around the
   -- 160x144 (or world) blit.  Drawn after the clear and before the game
   -- canvas so the playfield sits on top of the border.
   if Runtime.wantsHook("render.letterbox") then
+    if cut then love.graphics.setScissor(vux, vuy, vuw, vuh) end
     Runtime.call("render.letterbox", function() end, {
       ww = ww, wh = wh, pw = pw, ph = ph,
       ox = ox, oy = oy, vpw = vpw, vph = vph,
       scale = Sp, dpiX = dpiX, dpiY = dpiY,
       worldActive = self.worldActive and true or false,
     })
+    if cut then love.graphics.setScissor() end
   end
 
-  -- blit `canvas` at (sx, sy) LOVE-unit scales into origin (bx, by),
-  -- scissored to the (boxX, boxY, boxW, boxH) screen rect.  zoneSx/zoneSy
-  -- convert zone coords (canvas-space) into screen units.
+  -- see Renderer:blitCanvas; bound here to the frame's dpi so the composite
+  -- call sites below stay unchanged.
   local function blit(canvas, sx, sy, zoneList, zoneSx, zoneSy,
                       bx, by, boxX, boxY, boxW, boxH)
-    local shader = zoneList and zoneList[1] and PaletteFX.shader() or nil
-    if not shader then
-      love.graphics.setScissor(boxX, boxY, boxW, boxH)
-      love.graphics.draw(canvas, bx, by, 0, sx, sy)
-      love.graphics.setScissor()
-      return
-    end
-    love.graphics.setShader(shader)
-    -- a colors == false zone is the trueColor opt-out: its rect draws with
-    -- no shader at all.  Nothing sets one without a mod, so a vanilla zone
-    -- list never toggles and issues exactly the calls it always did.
-    local bare = false
-    for _, z in ipairs(zoneList) do
-      local plain = z.colors == false
-      if plain ~= bare then
-        bare = plain
-        love.graphics.setShader(not plain and shader or nil)
-      end
-      if not plain then PaletteFX.sendColors(shader, z.colors) end
-      if scissorClamped(bx + z.x * zoneSx, by + z.y * zoneSy,
-                        z.w * zoneSx, z.h * zoneSy,
-                        boxX, boxY, boxW, boxH) then
-        love.graphics.draw(canvas, bx, by, 0, sx, sy)
-      end
-    end
-    love.graphics.setScissor()
-    love.graphics.setShader()
+    return self:blitCanvas(canvas, sx, sy, zoneList, zoneSx, zoneSy,
+                           bx, by, boxX, boxY, boxW, boxH, dpiX, dpiY)
   end
+
+  local function clipToView(x, y, w, h)
+    return Renderer.clipToView(R, x, y, w, h)
+  end
+
+  -- ShaderFX shades the whole window at the UI's fixed GB-pixel scale, so
+  -- menus and text boxes keep the same LCD/grid geometry at any survey zoom.
+  -- A zoomed live world instead gets its own pass at the zoom scale, with
+  -- the UI shaded separately on a transparent layer and masked over it.
+  local fxScale = Up
+  local fxWorldScale = nil
 
   if self.worldOverride then
     -- A render pipeline already produced the whole world -- terrain,
@@ -548,26 +1044,31 @@ function Renderer:endFrame(zones, worldZones)
     -- skipped entirely (nothing drew into it).  The UI blit below still
     -- runs, so dialogs, menus and the HUD sit on top as usual.
     love.graphics.setColor(1, 1, 1, 1)
-    love.graphics.setScissor(0, 0, ww, wh)
-    love.graphics.draw(self.worldOverride, 0, 0, 0, 1 / dpiX, 1 / dpiY)
+    love.graphics.setScissor(vux, vuy, vuw, vuh)
+    local loveMajor = love.getVersion()
+    if love.system and love.system.getOS and love.system.getOS() == "iOS" and loveMajor >= 12 then
+      love.graphics.draw(self.worldOverride, vux, vuy + vuh, 0, 1 / dpiX, -1 / dpiY)
+    else
+      love.graphics.draw(self.worldOverride, vux, vuy, 0, 1 / dpiX, 1 / dpiY)
+    end
     love.graphics.setScissor()
     -- the screen-space overlays the flat path draws over its composite
     local fade = self.worldFadeAlpha
     if fade and fade > 0 then
-      love.graphics.setColor(0, 0, 0, fade)
-      love.graphics.rectangle("fill", 0, 0, ww, wh)
+      local c = self.worldFadeColor or { 0, 0, 0 }
+      love.graphics.setColor(c[1], c[2], c[3], fade)
+      love.graphics.rectangle("fill", vux, vuy, vuw, vuh)
       love.graphics.setColor(1, 1, 1, 1)
-    end
-    if self.battleCascadeProg then
-      self:drawBattleCascade(self.battleCascadeProg, ww, wh, ox, oy, vpw, vph, Sx, Sy)
     end
   elseif self.worldActive then
     local sp = Zoom.scale(Sp)
     local sx, sy = sp / dpiX, sp / dpiY
     local wvw = self.worldCanvas:getWidth()
     local wvh = self.worldCanvas:getHeight()
-    local wox = math.floor((pw - wvw * sp) / 2) / dpiX
-    local woy = math.floor((ph - wvh * sp) / 2) / dpiY
+    local woxPx = vx + math.floor((pw - wvw * sp) / 2)
+    local woyPx = vy + math.floor((ph - wvh * sp) / 2) - R.lift
+    local wox, woy = woxPx / dpiX, woyPx / dpiY
+    if present and ShaderFX.active() and sp ~= Up then fxWorldScale = sp end
     -- Tilt mode projects the ground world pass through the perspective mesh
     -- (SGB zones baked in beforehand -- see drawTiltedWorld -- so no zone
     -- scissoring here).  drawTiltedWorld returns false when tilt is off or
@@ -575,13 +1076,16 @@ function Renderer:endFrame(zones, worldZones)
     -- falls through to the flat blit, keeping the flat frame byte-for-byte
     -- identical to today.
     local projected =
-      Tilt.active() and self:drawTiltedWorld(worldZones or zones, sx, sy, wox, woy, present)
+      Tilt.active() and self:drawTiltedWorld(worldZones or zones, sx, sy, wox, woy,
+                                             present, vux, vuy, vuw, vuh)
     if not projected then
       if worldZones then
-        blit(self.worldCanvas, sx, sy, worldZones, sx, sy, wox, woy, 0, 0, ww, wh)
+        blit(self.worldCanvas, sx, sy, worldZones, sx, sy, wox, woy, vux, vuy, vuw, vuh)
       else
-        blit(self.worldCanvas, sx, sy, zones, Sx, Sy, wox, woy, 0, 0, ww, wh)
+        blit(self.worldCanvas, sx, sy, zones, Sx, Sy, wox, woy, vux, vuy, vuw, vuh)
       end
+      -- engine/battle/battle_transitions.asm:28
+      self.wipeWox, self.wipeWoy, self.wipeSx, self.wipeSy = wox, woy, sx, sy
       -- OBP-baked overworld sprites replay on top of the zone pass (GBC
       -- mode per-object coloring; see PaletteFX.markSpriteRedraw).  Grass
       -- feet-overdraw entries carry `colors` and re-colorize through the
@@ -589,7 +1093,7 @@ function Renderer:endFrame(zones, worldZones)
       local redraws = PaletteFX.spriteRedraws()
       if redraws[1] then
         love.graphics.setColor(1, 1, 1, 1)
-        love.graphics.setScissor(0, 0, ww, wh)
+        love.graphics.setScissor(vux, vuy, vuw, vuh)
         local activeShader = nil
         for _, r in ipairs(redraws) do
           local wanted = r.colors
@@ -621,7 +1125,7 @@ function Renderer:endFrame(zones, worldZones)
     if self.uprightActive then
       local M = self.UPRIGHT_MARGIN
       love.graphics.setColor(1, 1, 1, 1)
-      love.graphics.setScissor(0, 0, ww, wh)
+      love.graphics.setScissor(vux, vuy, vuw, vuh)
       love.graphics.draw(self.uprightCanvas, wox - M * sx, woy - M * sy, 0, sx, sy)
       love.graphics.setScissor()
     end
@@ -631,42 +1135,233 @@ function Renderer:endFrame(zones, worldZones)
     -- composite normally if one is ever stacked that way.
     local fade = self.worldFadeAlpha
     if fade and fade > 0 then
-      love.graphics.setColor(0, 0, 0, fade)
-      love.graphics.rectangle("fill", 0, 0, ww, wh)
+      local c = self.worldFadeColor or { 0, 0, 0 }
+      love.graphics.setColor(c[1], c[2], c[3], fade)
+      love.graphics.rectangle("fill", vux, vuy, vuw, vuh)
       love.graphics.setColor(1, 1, 1, 1)
     end
-    -- Battle transition: cascade black blocks into the area outside the
-    -- classic 160x144 wipe square (world still shows through until filled).
-    if self.battleCascadeProg then
-      self:drawBattleCascade(self.battleCascadeProg, ww, wh, ox, oy, vpw, vph, Sx, Sy)
+  end
+  -- BATTLE BG "world": the frozen overworld has just been composited and the
+  -- battle is about to blit over it.  Dim the world first, so the battle
+  -- reads as the foreground instead of competing with a fully lit map.  Goes
+  -- here rather than in the letterbox clear because with the world pass
+  -- active there is no clear -- the world already covers the surface.
+  --
+  -- The veil covers the voids ONLY, never the battle's own letterbox: "world"
+  -- changes what surrounds the battle and leaves the battle screen alone
+  -- (BattleState:bgMode).  On hardware there is no "behind the battle" to dim
+  -- at all -- _InitBattleCommon calls ClearScreen (pokered home/copy2.asm),
+  -- which blanks the whole tilemap before the battle draws.  A whole-surface
+  -- fill was invisible only because the classic battle paints an opaque paper
+  -- field over it a few lines below; a render pipeline that stages the fight
+  -- on the map and keys that field out got the veil straight onto its
+  -- sprites, HP bars and HUD, which is the 55% whole-window dim of #777
+  -- (and its duplicate #772).
+  if self.battleDim and self.battleDim > 0 then
+    love.graphics.setColor(0, 0, 0, self.battleDim)
+    for _, r in ipairs(subtractRect({ { vux, vuy, vuw, vuh } }, uox, uoy, uvpw, uvph)) do
+      love.graphics.rectangle("fill", r[1], r[2], r[3], r[4])
+    end
+    love.graphics.setColor(1, 1, 1, 1)
+  end
+
+  -- Extended/WORLD keeps the frozen world as the physical surround, but stock
+  -- Gen 1 back sprites rely on the battle's paper shade for visible highlights.
+  -- Back the exact fixed-width composition from physical top to bottom so only
+  -- the left and right sides expose the world.  The battle canvas and detached
+  -- HUD remain transparent layers composited afterward.
+  -- A worldOverride is an arena provider's completed scene (for example,
+  -- StadiumBattleFX/Dramaless).  It replaces the stock paper-backed battle
+  -- field, so never cover it with the native back-sprite fallback.
+  if self.extendedWorldBand and not self.worldOverride
+     and not FaithfulRes.scaleCap() then
+    local ok, Game = pcall(require, "src.core.Game")
+    love.graphics.setColor(PaletteFX.paperShade(ok and Game and Game.data))
+    love.graphics.rectangle("fill", uox, vuy, uvpw, vuh)
+    love.graphics.setColor(1, 1, 1, 1)
+  end
+
+  local uiLayer = nil
+  if fxWorldScale then
+    if not self.uiLayerCanvas or self.uiLayerCanvas:getWidth() ~= ww
+       or self.uiLayerCanvas:getHeight() ~= wh then
+      self.uiLayerCanvas = love.graphics.newCanvas(ww, wh)
+      self.uiLayerCanvas:setFilter("linear", "linear")
+    end
+    uiLayer = self.uiLayerCanvas
+    love.graphics.setCanvas(uiLayer)
+    love.graphics.clear(0, 0, 0, 0)
+  end
+
+  -- UI: anchored regions against their screen edges, the rest in the classic
+  -- centred letterbox.  With nothing anchored this is the single blit it has
+  -- always been.
+  local anchors = self.uiAnchors
+  if not anchors or #anchors == 0 then
+    blit(self.canvas, Ux, Uy, zones, Ux, Uy, uox, uoy, clipToView(uox, uoy, uvpw, uvph))
+  else
+    local rest = { { clipToView(uox, uoy, uvpw, uvph) } }
+    local placed = {}
+    for _, a in ipairs(anchors) do
+      local dw, dh = a.w * Ux, a.h * Uy
+      -- Anchors are edge-RELATIVE: an element keeps its distance from the
+      -- canvas edge, measured against the screen edge instead.  That is what
+      -- keeps a stack together -- the yes/no box sits 48px above the canvas
+      -- bottom, so bottom-anchoring lands it 48px above the screen bottom,
+      -- still directly over the dialogue box, rather than on top of it.
+      local gapR = (uiw - (a.x + a.w)) * Ux
+      local gapB = (uih - (a.y + a.h)) * Uy
+      local dx, dy
+      if a.anchor == "bottom" then
+        dx = uox + a.x * Ux -- horizontally it stays with the letterbox
+        dy = vuy + vuh - gapB - dh
+      elseif a.anchor == "top" then
+        dx = uox + a.x * Ux -- horizontally it stays with the letterbox
+        dy = vuy + a.y * Uy
+      elseif a.anchor == "topright" then
+        dx = vux + vuw - gapR - dw
+        dy = vuy + a.y * Uy
+      else -- unknown anchor: leave it where it is
+        dx, dy = uox + a.x * Ux, uoy + a.y * Uy
+      end
+      if a.windowClamped then
+        dx = math.max(vux, math.min(math.max(vux, vux + vuw - dw), dx))
+        dy = math.max(vuy, math.min(math.max(vuy, vuy + vuh - dh), dy))
+      end
+      placed[#placed + 1] = { a = a, dx = dx, dy = dy, dw = dw, dh = dh }
+      if a.extract then
+        rest = subtractRect(rest, uox + a.x * Ux, uoy + a.y * Uy, dw, dh)
+      end
+    end
+    for _, r in ipairs(rest) do
+      blit(self.canvas, Ux, Uy, zones, Ux, Uy, uox, uoy, r[1], r[2], r[3], r[4])
+    end
+    for _, p in ipairs(placed) do
+      -- shift the draw origin so canvas pixel (a.x, a.y) lands on (dx, dy).
+      -- The zone scissors are computed from the same origin, so an SGB
+      -- region travels with the element instead of staying in the letterbox.
+      blit(p.a.canvas or self.canvas, Ux, Uy, zones, Ux, Uy,
+           p.dx - p.a.x * Ux, p.dy - p.a.y * Uy,
+           clipToView(p.dx, p.dy, p.dw, p.dh))
     end
   end
-  -- UI stays in the classic centered GB letterbox
-  blit(self.canvas, Sx, Sy, zones, Sx, Sy, ox, oy, ox, oy, vpw, vph)
+  local uiRedraws = PaletteFX.uiSpriteRedraws()
+  if uiRedraws[1] then
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.setScissor(clipToView(uox, uoy, uvpw, uvph))
+    for _, r in ipairs(uiRedraws) do
+      if r.quad then
+        love.graphics.draw(r.image, r.quad, uox + r.x * Ux, uoy + r.y * Uy,
+                           0, Ux, Uy)
+      else
+        love.graphics.draw(r.image, uox + r.x * Ux, uoy + r.y * Uy, 0, Ux, Uy)
+      end
+    end
+    love.graphics.setScissor()
+  end
+
+  -- engine/battle/battle_transitions.asm:1
+  if self.battleWipe then
+    self:drawBattleWipe(self.battleWipe, vuw, vuh, ox, oy, vpw, vph, Sx, Sy,
+                        vux, vuy)
+    -- engine/battle/battle_transitions.asm:169
+    if self.wipeSprites and self.wipeWox
+       and (self.battleWipe.prog or 0) < 1 then
+      love.graphics.setColor(1, 1, 1, 1)
+      love.graphics.setScissor(clipToView(vux, vuy, vuw, vuh))
+      love.graphics.push()
+      love.graphics.translate(self.wipeWox, self.wipeWoy)
+      love.graphics.scale(self.wipeSx, self.wipeSy)
+      pcall(self.wipeSprites)
+      love.graphics.pop()
+      love.graphics.setShader()
+      love.graphics.setScissor()
+      love.graphics.setColor(1, 1, 1, 1)
+    end
+  end
+
+  -- Palette-register effects (BattleTransition_FlashScreen's rBGP writes, the
+  -- GBFadeInFromWhite after a battle) tint every pixel the LCD shows -- there
+  -- is no "outside the screen" on hardware for them to miss.  So they are
+  -- painted here, over the finished composite, rather than into the 160x144
+  -- UI canvas: at any zoom above 1x a letterbox-only veil left the
+  -- surrounding window untouched, which read as the effect happening inside
+  -- a window rather than to the whole screen.  { shade, alpha }.
+  local veil = self.screenVeil
+  if veil and veil[2] > 0 then
+    love.graphics.setColor(veil[1], veil[1], veil[1], veil[2])
+    -- FAITHFUL RATIO's mobile lock: the surface the player sees is the
+    -- locked viewport and the bars around it are dead display, not screen
+    -- (src/core/FaithfulRes.lua).  A whole-window veil lit the entire phone
+    -- for the battle flash and the post-battle fade (#864), so under the
+    -- lock the veil stops at the letterbox.  The desktop lock is unaffected:
+    -- there the window IS the viewport.
+    if FaithfulRes.scaleCap() then
+      love.graphics.rectangle("fill", ox, oy, vpw, vph)
+    else
+      love.graphics.rectangle("fill", vux, vuy, vuw, vuh)
+    end
+    love.graphics.setColor(1, 1, 1, 1)
+  end
 
   if present then
-    love.graphics.setCanvas()
+    GameViewport.setTarget()
     -- Post-process pipelines run over the finished composite -- world, UI
-    -- and all -- and before GBC FX, so a blur or colour grade is what the
-    -- LCD grid is then drawn over rather than something that smears the
-    -- grid itself.  Each pass hands back a canvas; with none registered
+    -- and all -- and before ShaderFX, so a blur or colour grade is what a
+    -- shader preset is then drawn over rather than something that smears
+    -- it.  Each pass hands back a canvas; with none registered
     -- this returns `present` unchanged and the frame is byte-identical.
     local composed = Pipelines.present(present,
       { width = ww, height = wh, scale = Sp, dpi = dpiY, dpiX = dpiX, dpiY = dpiY }) or present
-    if GBCFX.active() then
-      -- shader grid/shadow math is in framebuffer pixels
-      GBCFX.present(composed, Sp)
-    else
-      -- the present canvas only existed for the post-process, so put the
-      -- result on the screen at the same 1:1 unit mapping it was built at
+    local outputHandled = hasOutputHook
+      and Runtime.call("render.output", function() return false end, {
+        canvas = composed,
+        width = ww, height = wh,
+        gameX = ox, gameY = oy,
+        gameWidth = vpw, gameHeight = vph,
+        scale = Sp, dpiX = dpiX, dpiY = dpiY,
+        generation = 1,
+      }) == true
+    if not outputHandled then
+      if cut then love.graphics.setScissor(vux, vuy, vuw, vuh) end
+      if ShaderFX.active() then
+        -- Shades the whole window, letterbox included, not just the game rect.
+        local fxPxW, fxPxH = ww * dpiX, wh * dpiY
+        local worldScale = fxWorldScale or fxScale
+        ShaderFX.render(composed,
+          { x = 0, y = 0, w = fxPxW, h = fxPxH, scale = worldScale },
+          { w = fxPxW / worldScale, h = fxPxH / worldScale },
+          dpiX, dpiY)
+        if uiLayer then
+          ShaderFX.render(uiLayer,
+            { x = 0, y = 0, w = fxPxW, h = fxPxH, scale = fxScale },
+            { w = fxPxW / fxScale, h = fxPxH / fxScale },
+            dpiX, dpiY, { layer = "ui", mask = true })
+        end
+      else
+        -- the present canvas only existed for the post-process, so put the
+        -- result on the screen at the same 1:1 unit mapping it was built at
+        love.graphics.setColor(1, 1, 1, 1)
+        love.graphics.draw(composed, 0, 0)
+      end
+      if cut then love.graphics.setScissor() end
+    elseif uiLayer then
       love.graphics.setColor(1, 1, 1, 1)
-      love.graphics.draw(composed, 0, 0)
+      love.graphics.draw(uiLayer, 0, 0)
     end
   end
   self.worldActive = false
   self.uprightActive = false
   self.worldOverride = nil
   PaletteFX.setPass(nil)
+  return {
+    width = ww, height = wh,
+    gameX = ox, gameY = oy,
+    gameWidth = vpw, gameHeight = vph,
+    scale = Sp,
+    dpiX = dpiX, dpiY = dpiY,
+    viewX = vux, viewY = vuy, viewWidth = vuw, viewHeight = vuh,
+  }
 end
 
 return Renderer

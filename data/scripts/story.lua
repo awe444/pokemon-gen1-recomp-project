@@ -94,6 +94,27 @@ M.VIRIDIAN_CITY = {
       { "show_text", "_ViridianCityOldManTimeIsMoneyText" },             -- 8 (9 = end)
     },
   },
+  -- Re-apply the Pokedex old-man swap for a save that already holds the flag
+  -- but was never standing here when it fired: a vanilla .sav imported
+  -- through src/save_convert, whose codec does not model pokered's
+  -- wToggleableObjectFlags array, so save.objectToggles arrives empty and
+  -- both objects fall back to their compiled-in defaults -- the sleeper ON
+  -- (data/maps/toggleable_objects.asm toggleable_objects_for VIRIDIAN_CITY),
+  -- still lying across the north path (#234).
+  -- OaksLabOakGivesPokedexScript (scripts/OaksLab.asm) sets EVENT_GOT_POKEDEX
+  -- and, with no branch in between, runs HideObject TOGGLE_LYING_OLD_MAN /
+  -- ShowObject TOGGLE_OLD_MAN, so that one flag settles both toggles exactly.
+  -- Same shape as M.OAKS_LAB.onEnter in data/scripts/oaks_lab.lua, which
+  -- re-applies the same script's other two HideObjects on entry (#106).
+  onEnter = function(game, ow)
+    if not (game.save.flags and game.save.flags.EVENT_GOT_POKEDEX) then
+      return
+    end
+    local Commands = require("src.script.Commands")
+    local ctx = { save = game.save, game = game, overworld = ow }
+    Commands.hide_object(ctx, "VIRIDIAN_CITY", "VIRIDIANCITY_OLD_MAN_SLEEPY")
+    Commands.show_object(ctx, "VIRIDIAN_CITY", "VIRIDIANCITY_OLD_MAN")
+  end,
   -- ViridianCityCheckGotPokedexScript: the north corridor is gated on
   -- EVENT_GOT_POKEDEX, NOT on the sleeper being hidden, and it triggers
   -- on exactly one cell -- (19,9), the gap east of the sleeper (18,9)
@@ -106,7 +127,7 @@ M.VIRIDIAN_CITY = {
     game.stack:push(TextBox.new(game,
       game.data.text._ViridianCityOldManSleepyPrivatePropertyText
       or "You can't go\nthrough here!\fThis is private\nproperty!",
-      function() ow:scriptMove(ow.player, "down", 1) end))
+      function() ow:scriptMove(ow.player, "down", 1, nil, { collide = true }) end))
     return true
   end,
 }
@@ -119,22 +140,29 @@ M.VIRIDIAN_CITY = {
 -- Daisy hands over the TOWN MAP once Oak's errand is under way
 -- (scripts/BluesHouse.asm BluesHouseDaisySittingText)
 M.BLUES_HOUSE = {
+  -- scripts/BluesHouse.asm:12-16
+  onEnter = function(game, ow)
+    game.save.flags.EVENT_ENTERED_BLUES_HOUSE = true
+  end,
   talk = {
     TEXT_BLUESHOUSE_DAISY_SITTING = {
-      { "face_player" },                                     -- 1
-      { "check_flag", "EVENT_GOT_TOWN_MAP" },                -- 2
-      { "jump_if_true", 10 },                                -- 3
-      { "check_flag", "EVENT_GOT_STARTER" },                 -- 4
-      { "jump_if_false", 12 },                               -- 5
-      { "show_text", "_BluesHouseDaisyOfferMapText" },       -- 6
+      { "face_player" },
+      { "check_flag", "EVENT_GOT_TOWN_MAP" },
+      { "jump_if_true", "got_map" },
+      { "check_flag", "EVENT_GOT_POKEDEX" },
+      { "jump_if_false", "too_early" },
+      { "show_text", "_BluesHouseDaisyOfferMapText" },
       -- _GotMapText: "{PLAYER} got a\n{RAM:wStringBuffer}!" -- the
       -- buffer supplies "TOWN MAP" (scripts/BluesHouse.asm GotMapText)
-      { "give_item", "TOWN_MAP", 1, "_GotMapText" },         -- 7
-      { "set_flag", "EVENT_GOT_TOWN_MAP" },                  -- 8
-      { "jump", 13 },                                        -- 9
-      { "show_text", "_BluesHouseDaisyUseMapText" },         -- 10
-      { "jump", 13 },                                        -- 11
-      { "show_text", "_BluesHouseDaisyRivalAtLabText" },     -- 12
+      { "give_item", "TOWN_MAP", 1, "_GotMapText" },
+      { "hide_object", "BLUES_HOUSE", "BLUESHOUSE_TOWN_MAP" },
+      { "set_flag", "EVENT_GOT_TOWN_MAP" },
+      { "jump", "end" },
+      { "label", "got_map" },
+      { "show_text", "_BluesHouseDaisyUseMapText" },
+      { "jump", "end" },
+      { "label", "too_early" },
+      { "show_text", "_BluesHouseDaisyRivalAtLabText" },
     },
   },
 }
@@ -162,11 +190,17 @@ M.BILLS_HOUSE = {
                                    overworld = ow },
                                  "BILLS_HOUSE", "BILLSHOUSE_BILL_POKEMON")
             game.save.flags.EVENT_BILL_SAID_USE_CELL_SEPARATOR = true
+            require("src.world.PikachuFollower").onBillEnteredMachine(game, ow)
             done()
           end
           if ow.player.facing == "down" then
             -- the player is standing on his straight path: walk around
-            -- (.PokemonWalkAroundPlayerMovement)
+            -- (.PokemonWalkAroundPlayerMovement).  BillsHouseScript2 runs
+            -- BillsHousePikachuWatchPlayer first on this branch, so a
+            -- Pikachu that is still following steps clear of Bill's detour
+            -- and turns to watch the player (#455).
+            require("src.world.PikachuFollower")
+              .onBillWalksAroundPlayer(game, ow)
             ow:scriptMove(npc, "right", 1, function()
               ow:scriptMove(npc, "up", 2, function()
                 ow:scriptMove(npc, "left", 1, function()
@@ -202,7 +236,8 @@ M.BILLS_HOUSE = {
       -- the received text that reads it (scripts/BillsHouse.asm; the
       -- item id is S_S_TICKET in generated items.lua -- keyItem, so the
       -- sound_get_key_item jingle plays like BillsHouse.asm:196)
-      { "give_item", "S_S_TICKET", 1, false },                     -- 5
+      -- .bag_full (scripts/BillsHouse.asm:184-186)
+      { "give_item", "S_S_TICKET", 1, false, "_SSTicketNoRoomText" }, -- 5
       { "show_text", "_SSTicketReceivedText" },                    -- 6
       { "set_flag", "EVENT_GOT_SS_TICKET" },                       -- 7
       -- The two Cerulean guards are a SWAP PAIR, not scenery
@@ -252,6 +287,9 @@ M.BILLS_HOUSE = {
       Commands.hide_object(ctx, "BILLS_HOUSE", "BILLSHOUSE_BILL1")
       Commands.show_object(ctx, "BILLS_HOUSE", "BILLSHOUSE_BILL2")
     end
+    if not flags.EVENT_MET_BILL_2 then
+      require("src.world.PikachuFollower").onBillsHouseEnter(game, ow)
+    end
   end,
 }
 
@@ -264,6 +302,7 @@ M.BILLS_HOUSE = {
 
 M.ROUTE_25 = {
   onEnter = function(game, ow)
+    game.save.pikachuMapScriptActive = nil
     local flags = game.save.flags
     if flags.EVENT_LEFT_BILLS_HOUSE_AFTER_HELPING then return end
     local Commands = require("src.script.Commands")
@@ -296,6 +335,7 @@ M.VERMILION_CITY = {
   -- only read while EVENT_1ST_LOCK_OPENED is unset (the gym is only
   -- reachable through this map, so a fresh visit always re-rolls).
   onEnter = function(game, ow)
+    game.save.pikachuMapScriptActive = nil
     local puz = game.save.trashPuzzle or {}
     game.save.trashPuzzle = puz
     puz.first = love.math.random(0, 7) * 2
@@ -317,7 +357,7 @@ M.VERMILION_CITY = {
     if shipLeft then
       game.stack:push(TextBox.new(game,
         t._VermilionCitySailor1ShipSetSailText or "The ship set sail.",
-        function() ow:scriptMove(ow.player, "up", 1) end))
+        function() ow:scriptMove(ow.player, "up", 1, nil, { collide = true }) end))
       return true
     end
     -- Walk-past is never facing-right / inFrontOfOrBehindGuardCoords, so
@@ -338,26 +378,39 @@ M.VERMILION_CITY = {
       ask .. "\f"
       .. (t._VermilionCitySailor1YouNeedATicketText
           or "You need a ticket\nto get aboard."),
-      function() ow:scriptMove(ow.player, "up", 1) end))
+      function() ow:scriptMove(ow.player, "up", 1, nil, { collide = true }) end))
     return true
   end,
   talk = {
-    -- the sailor guarding the dock gangway (VermilionCitySailor1Text):
-    -- flashing the ticket just lets you through -- he never hides, and
-    -- once the ship has sailed he only reports it gone
-    TEXT_VERMILIONCITY_SAILOR1 = {
-      { "face_player" },                                             -- 1
-      { "check_flag", "EVENT_SS_ANNE_LEFT" },                        -- 2
-      { "jump_if_true", 11 },                                        -- 3
-      { "show_text", "_VermilionCitySailor1DoYouHaveATicketText" },  -- 4
-      { "check_item", "S_S_TICKET" },                                -- 5
-      { "jump_if_false", 9 },                                        -- 6
-      { "show_text", "_VermilionCitySailor1FlashedTicketText" },     -- 7
-      { "jump", 12 },                                                -- 8
-      { "show_text", "_VermilionCitySailor1YouNeedATicketText" },    -- 9
-      { "jump", 12 },                                                -- 10
-      { "show_text", "_VermilionCitySailor1ShipSetSailText" },       -- 11
-    },
+    -- scripts/VermilionCity.asm:158 (#1651)
+    TEXT_VERMILIONCITY_SAILOR1 = function(game, ow, npc, done)
+      local Flags = require("src.script.Flags")
+      local TextBox = require("src.render.TextBox")
+      local t = game.data.text
+      if Flags.get(game.save, "EVENT_SS_ANNE_LEFT") then
+        game.stack:push(TextBox.new(game,
+          t._VermilionCitySailor1ShipSetSailText or "The ship set sail.",
+          done))
+        return
+      end
+      -- scripts/VermilionCity.asm:195
+      local p = ow and ow.player
+      if not p or p.facing == "right"
+         or (p.cellX == 19 and (p.cellY == 29 or p.cellY == 31)) then
+        game.stack:push(TextBox.new(game,
+          t._VermilionCitySailor1WelcomeToSSAnneText
+            or "Welcome to S.S.\nANNE!", done))
+        return
+      end
+      local ask = t._VermilionCitySailor1DoYouHaveATicketText
+        or "Welcome to S.S.\nANNE!\fExcuse me, do you\nhave a ticket?"
+      local tail = ((game.save.inventory.S_S_TICKET or 0) > 0)
+        and (t._VermilionCitySailor1FlashedTicketText
+             or "{PLAYER} flashed\nthe S.S.TICKET!")
+        or (t._VermilionCitySailor1YouNeedATicketText
+            or "You need a ticket\nto get aboard.")
+      game.stack:push(TextBox.new(game, ask .. "\f" .. tail, done))
+    end,
   },
 }
 
@@ -366,13 +419,14 @@ M.SS_ANNE_2F = {
     TEXT_SSANNE2F_RIVAL = {
       { "face_player" },                                  -- 1
       { "check_flag", "EVENT_BEAT_SS_ANNE_RIVAL" },       -- 2
-      { "jump_if_true", 9 },                              -- 3
+      { "jump_if_true", 9 },                              -- 3 (beaten: silent)
       { "show_text", "_SSAnne2FRivalText" },              -- 4
-      { "rival_battle", "OPP_RIVAL2", 1 },                -- 5
-      { "jump_if_false", 10 },                            -- 6
-      { "set_flag", "EVENT_BEAT_SS_ANNE_RIVAL" },         -- 7
-      { "show_text", "_SSAnne2FRivalDefeatedText" },      -- 8
-      { "jump", 10 },                                     -- 9 (already beaten: silent)
+      -- SSAnne2FRivalText's text_asm arms SaveEndBattleTextPointers
+      -- (scripts/SSAnne2F.asm:199), so the line prints in battle (#1688)
+      { "save_end_battle_text", "_SSAnne2FRivalDefeatedText" }, -- 5
+      { "rival_battle", "OPP_RIVAL2", 1 },                -- 6
+      { "jump_if_false", 9 },                             -- 7
+      { "set_flag", "EVENT_BEAT_SS_ANNE_RIVAL" },         -- 8
     },
   },
 }
@@ -575,12 +629,34 @@ local function snorlaxWake(mapId, objName, beatFlag, wokeUpText, calmedText)
   }
 end
 
+-- A beaten Snorlax is gone for good: Route12/Route16DefaultScript run
+-- HideObject in the same breath as the battle that sets
+-- EVENT_BEAT_ROUTEnn_SNORLAX, so "event set, object still on the map" is a
+-- state the asm cannot produce.  Here it can (a mod's world:toggleObject, a
+-- save edited or migrated from a build older than the flag), and it is a
+-- dead end: ItemEffects' adjacentSleepingSnorlax refuses to wake a Snorlax
+-- whose beat flag is set (ItemUsePokeFlute's CheckEvent, engine/items/
+-- item_effects.asm), so the sleeper sits in the road forever and Cycling
+-- Road is unreachable (#585).  Reconcile the toggle from the flag on every
+-- entry -- the mirror of SaveData.lua's toggle -> flag backfill, and the
+-- same repair shape the Silph Co. floors use below.
+local function hideBeatenSnorlax(mapId, objName, beatFlag)
+  return function(game, ow)
+    if not game.save.flags[beatFlag] then return end
+    local Commands = require("src.script.Commands")
+    Commands.hide_object({ game = game, save = game.save, overworld = ow },
+                         mapId, objName)
+  end
+end
+
 -- snorlaxWake is looked up by ItemEffects.lua/BagMenu.lua (via
 -- data/scripts/init.lua's M.get) and run when the flute wakes Snorlax;
 -- objName/beatFlag let ItemEffects find the NPC and check whether it's
 -- already been beaten before allowing the wake.
 M.ROUTE_12 = {
   talk = { TEXT_ROUTE12_SNORLAX = { { "show_text", "_Route12SnorlaxText" } } },
+  onEnter = hideBeatenSnorlax("ROUTE_12", "ROUTE12_SNORLAX",
+                              "EVENT_BEAT_ROUTE12_SNORLAX"),
   snorlaxWake = {
     objName = "ROUTE12_SNORLAX", beatFlag = "EVENT_BEAT_ROUTE12_SNORLAX",
     script = snorlaxWake("ROUTE_12", "ROUTE12_SNORLAX", "EVENT_BEAT_ROUTE12_SNORLAX",
@@ -589,6 +665,8 @@ M.ROUTE_12 = {
 }
 M.ROUTE_16 = {
   talk = { TEXT_ROUTE16_SNORLAX = { { "show_text", "_Route16Text7" } } },
+  onEnter = hideBeatenSnorlax("ROUTE_16", "ROUTE16_SNORLAX",
+                              "EVENT_BEAT_ROUTE16_SNORLAX"),
   snorlaxWake = {
     objName = "ROUTE16_SNORLAX", beatFlag = "EVENT_BEAT_ROUTE16_SNORLAX",
     script = snorlaxWake("ROUTE_16", "ROUTE16_SNORLAX", "EVENT_BEAT_ROUTE16_SNORLAX",
@@ -620,11 +698,18 @@ M.SAFARI_ZONE_SECRET_HOUSE = {
 M.WARDENS_HOUSE = {
   talk = {
     TEXT_WARDENSHOUSE_WARDEN = {
+      -- Labelled rather than hand-numbered: the branches here have been
+      -- re-pointed twice now (#535, #645), and every insert used to mean
+      -- renumbering three jumps that had no way of announcing they were stale.
       { "face_player" },                                             -- 1
       { "check_flag", "EVENT_GOT_HM04" },                            -- 2
-      { "jump_if_true", 13 },                                        -- 3
+      -- #535: previously jumped to the same silent-end target as the
+      -- give-then-thank fallthrough, so the warden said nothing on every
+      -- visit after the trade. pokered's .got_item branch
+      -- (scripts/WardensHouse.asm) instead prints HM04ExplanationText.
+      { "jump_if_true", "got_hm04" },                                -- 3
       { "check_item", "GOLD_TEETH" },                                -- 4
-      { "jump_if_false", 15 },                                       -- 5
+      { "jump_if_false", "no_teeth" },                               -- 5
       { "show_text", "_WardensHouseWardenGaveTheGoldTeethText" },    -- 6
       { "take_item", "GOLD_TEETH", 1 },                              -- 7
       { "set_flag", "EVENT_GAVE_GOLD_TEETH" },                       -- 8
@@ -633,9 +718,27 @@ M.WARDENS_HOUSE = {
       { "give_item", "HM_STRENGTH", 1, false },                      -- 10
       { "show_text", "_WardensHouseWardenReceivedHM04Text" },        -- 11
       { "set_flag", "EVENT_GOT_HM04" },                              -- 12
-      { "jump", 16 },                                                -- 13 (already got it)
-      { "jump", 16 },                                                -- 14 (unused)
-      { "show_text", "_WardensHouseWardenGibberish1Text" },          -- 15
+      { "jump", "end" },                                             -- 13 (jp .done)
+
+      -- #645: WardensHouseWardenText prints Gibberish1, then YesNoChoice,
+      -- and the warden answers the same gibberish either way -- Gibberish2
+      -- on yes, Gibberish3 on no (scripts/WardensHouse.asm).  The port
+      -- printed the question and walked off before the answer.
+      { "label", "no_teeth" },                                       -- 14
+      { "ask", "_WardensHouseWardenGibberish1Text" },                -- 15
+      { "jump_if_true", "gibberish_yes" },                           -- 16
+      { "show_text", "_WardensHouseWardenGibberish3Text" },          -- 17
+      { "jump", "end" },                                             -- 18
+      { "label", "gibberish_yes" },                                  -- 19
+      { "show_text", "_WardensHouseWardenGibberish2Text" },          -- 20
+      { "jump", "end" },                                             -- 21
+
+      -- #535: pokered .got_item branch (scripts/WardensHouse.asm) --
+      -- printed on every subsequent talk once EVENT_GOT_HM04 is set.
+      -- Text is _WardensHouseWardenHM04ExplanationText (text/WardensHouse.asm):
+      -- HM04 teaches Strength, and hints at the Safari Zone secret house.
+      { "label", "got_hm04" },                                       -- 22
+      { "show_text", "_WardensHouseWardenHM04ExplanationText" },     -- 23
     },
   },
 }
@@ -644,6 +747,70 @@ M.WARDENS_HOUSE = {
 -- Silph Co. president (scripts/SilphCo11F.asm; Giovanni there is the
 -- generic OPP_GIOVANNI#2 battle)
 -- -------------------------------------------------------------------
+
+-- SilphCo11FTeamRocketLeavesScript (scripts/SilphCo11F.asm) hides every
+-- ROCKET and rocket-aligned SCIENTIST toggle on 2F-11F the moment Giovanni
+-- falls; the item balls, the 2F/10F rescued workers and the 7F rival keep
+-- theirs.  Names and order are data/maps/toggleable_objects.asm's
+-- TOGGLE_SILPH_CO_<floor>_n entries.  Saffron City's half of the same
+-- script lives in M.SAFFRON_CITY (story4.lua) (#392).
+local SILPH_ROCKET_OBJECTS = {
+  { "SILPH_CO_2F",  { "SILPHCO2F_SCIENTIST1", "SILPHCO2F_SCIENTIST2",
+                      "SILPHCO2F_ROCKET1", "SILPHCO2F_ROCKET2" } },
+  { "SILPH_CO_3F",  { "SILPHCO3F_ROCKET", "SILPHCO3F_SCIENTIST" } },
+  { "SILPH_CO_4F",  { "SILPHCO4F_ROCKET1", "SILPHCO4F_SCIENTIST",
+                      "SILPHCO4F_ROCKET2" } },
+  { "SILPH_CO_5F",  { "SILPHCO5F_ROCKET1", "SILPHCO5F_SCIENTIST",
+                      "SILPHCO5F_ROCKER", "SILPHCO5F_ROCKET2" } },
+  { "SILPH_CO_6F",  { "SILPHCO6F_ROCKET1", "SILPHCO6F_SCIENTIST",
+                      "SILPHCO6F_ROCKET2" } },
+  { "SILPH_CO_7F",  { "SILPHCO7F_ROCKET1", "SILPHCO7F_SCIENTIST",
+                      "SILPHCO7F_ROCKET2", "SILPHCO7F_ROCKET3" } },
+  { "SILPH_CO_8F",  { "SILPHCO8F_ROCKET1", "SILPHCO8F_SCIENTIST",
+                      "SILPHCO8F_ROCKET2" } },
+  { "SILPH_CO_9F",  { "SILPHCO9F_ROCKET1", "SILPHCO9F_SCIENTIST",
+                      "SILPHCO9F_ROCKET2" } },
+  { "SILPH_CO_10F", { "SILPHCO10F_ROCKET", "SILPHCO10F_SCIENTIST" } },
+  { "SILPH_CO_11F", { "SILPHCO11F_GIOVANNI", "SILPHCO11F_ROCKET1",
+                      "SILPHCO11F_ROCKET2" } },
+}
+
+-- hide_object writes save.objectToggles, so the single pass at the win
+-- covers floors the player is not standing on; onlyMap is the per-floor
+-- repair path below.
+local function silphRocketsLeave(game, ow, onlyMap)
+  local Commands = require("src.script.Commands")
+  local ctx = { game = game, save = game.save, overworld = ow }
+  for _, floor in ipairs(SILPH_ROCKET_OBJECTS) do
+    if not onlyMap or onlyMap == floor[1] then
+      for _, name in ipairs(floor[2]) do
+        Commands.hide_object(ctx, floor[1], name)
+      end
+    end
+  end
+end
+
+-- SilphCo11FGiovanniAfterBattleScript (scripts/SilphCo11F.asm) is the whole
+-- aftermath: DisplayTextID TEXT_SILPHCO11F_GIOVANNI_YOU_RUINED_OUR_PLANS,
+-- GBFadeOutToBlack, SilphCo11FTeamRocketLeavesScript, Delay3,
+-- GBFadeInFromBlack, then SetEvent.  The port had only the hide pass, so the
+-- speech never played and every rocket blinked out in front of the player
+-- (#722).  Same hide list as silphRocketsLeave, spelled as script rows so the
+-- fade can hold over it.
+local function silphAftermathRows()
+  local rows = {
+    { "show_text", "_SilphCo11FGiovanniYouRuinedOurPlansText" },
+    { "fade", "out" },
+  }
+  for _, floor in ipairs(SILPH_ROCKET_OBJECTS) do
+    for _, name in ipairs(floor[2]) do
+      rows[#rows + 1] = { "hide_object", floor[1], name }
+    end
+  end
+  rows[#rows + 1] = { "wait", 3 }   -- Delay3
+  rows[#rows + 1] = { "fade", "in" }
+  return rows
+end
 
 M.SILPH_CO_11F = {
   -- Giovanni's battle is a COORDINATE TRIGGER, not a talk.
@@ -657,9 +824,13 @@ M.SILPH_CO_11F = {
   -- line) would touch, and the whole Silph ending -- the flag, the Master
   -- Ball, the Saffron streets clearing -- silently never happened.
   --
-  -- engageTrainer shows TEXT_SILPHCO11F_GIOVANNI as the battle text and,
-  -- via victories.lua OPP_GIOVANNI#2, sets the event on a win; a loss
-  -- sets nothing, so the trigger re-arms exactly as vanilla does.
+  -- SilphCo11FDefaultScript orders it DisplayTextID TEXT_SILPHCO11F_GIOVANNI
+  -- FIRST, then MoveSprite .GiovanniMovement: he speaks from behind the desk
+  -- and only then walks the three tiles down.  Moving him before the box made
+  -- him cross the room in silence and deliver the speech point-blank (#869),
+  -- so the box comes first here and engageTrainer skips its own battle text.
+  -- victories.lua OPP_GIOVANNI#2 sets the event on a win; a loss sets
+  -- nothing, so the trigger re-arms exactly as vanilla does.
   onStep = function(game, ow, x, y)
     if game.save.flags.EVENT_BEAT_SILPH_CO_GIOVANNI then return false end
     if not ((x == 6 and y == 13) or (x == 7 and y == 12)) then return false end
@@ -668,44 +839,72 @@ M.SILPH_CO_11F = {
       if npc.def and npc.def.name == "SILPHCO11F_GIOVANNI" then gio = npc break end
     end
     if not gio or ow:trainerDefeated(gio) then return false end
-    ow:scriptMove(gio, "down", 3, function()
-      gio:facePlayer(ow.player)
-      ow:engageTrainer(gio, function()
-        -- SilphCo11FTeamRocketLeavesScript: Giovanni leaves the floor
-        -- after the loss (the street rockets are handled by
-        -- M.SAFFRON_CITY.onEnter in story4.lua).
-        if game.save.flags.EVENT_BEAT_SILPH_CO_GIOVANNI then
-          local Commands = require("src.script.Commands")
-          local ctx = { game = game, save = game.save, overworld = ow }
-          Commands.hide_object(ctx, "SILPH_CO_11F", "SILPHCO11F_GIOVANNI")
-        end
-      end)
-    end)
+    local TextBox = require("src.render.TextBox")
+    game.stack:push(TextBox.new(game,
+      game.data.text._SilphCo11FGiovanniText
+      or "Ah {PLAYER}!\nSo we meet again!",
+      function()
+        ow:scriptMove(gio, "down", 3, function()
+          gio:facePlayer(ow.player)
+          ow:engageTrainer(gio, function()
+            -- SilphCo11FGiovanniAfterBattleScript: the "Blast it all!"
+            -- speech, then SilphCo11FTeamRocketLeavesScript behind a fade so
+            -- every Silph rocket leaves off-screen (the street rockets are
+            -- handled by M.SAFFRON_CITY.onEnter in story4.lua).  Queued, not
+            -- run here: the battle's own callbacks are still unwinding, so
+            -- queueScript starts it on the first idle overworld frame (#722).
+            if game.save.flags.EVENT_BEAT_SILPH_CO_GIOVANNI then
+              ow:queueScript(silphAftermathRows())
+            end
+          end,
+          -- "Arrgh!!" is armed for the battle screen, not the map
+          -- (scripts/SilphCo11F.asm:264-266 SaveEndBattleTextPointers) #1606
+          game.data.text._SilphCo10FGiovanniILostAgainText, true)
+        end)
+      end))
     return true
   end,
   onEnter = function(game, ow)
     if game.save.flags.EVENT_BEAT_SILPH_CO_GIOVANNI then
-      local Commands = require("src.script.Commands")
-      local ctx = { game = game, save = game.save, overworld = ow }
-      Commands.hide_object(ctx, "SILPH_CO_11F", "SILPHCO11F_GIOVANNI")
+      silphRocketsLeave(game, ow)
     end
   end,
   talk = {
+    -- SilphCo11FSilphPresidentText branches on EVENT_GOT_MASTER_BALL only:
+    -- the teleport pads reach him without passing Giovanni's trigger, and
+    -- afterwards he describes the ball forever.  The old rows fell off the
+    -- end of the script on both branches, so a second talk was silence
+    -- (#392).
     TEXT_SILPHCO11F_SILPH_PRESIDENT = {
       { "face_player" },                                                     -- 1
-      { "check_flag", "EVENT_BEAT_SILPH_CO_GIOVANNI" },                      -- 2
-      { "jump_if_false", 10 },                                               -- 3
-      { "check_flag", "EVENT_GOT_MASTER_BALL" },                             -- 4
-      { "jump_if_true", 10 },                                                -- 5
-      { "show_text", "_SilphCo11FSilphPresidentText" },                      -- 6
+      { "check_flag", "EVENT_GOT_MASTER_BALL" },                             -- 2
+      { "jump_if_true", 9 },                                                 -- 3
+      { "show_text", "_SilphCo11FSilphPresidentText" },                      -- 4
       -- give-then-print like scripts/SilphCo11F.asm
-      { "give_item", "MASTER_BALL", 1, false },                              -- 7
-      { "show_text", "_SilphCo11FSilphPresidentReceivedMasterBallText" },    -- 8
-      { "set_flag", "EVENT_GOT_MASTER_BALL" },                               -- 9
-      { "jump", 11 },                                                        -- 10
+      { "give_item", "MASTER_BALL", 1, false },                              -- 5
+      { "show_text", "_SilphCo11FSilphPresidentReceivedMasterBallText" },    -- 6
+      { "set_flag", "EVENT_GOT_MASTER_BALL" },                               -- 7
+      { "jump", "end" },                                                     -- 8
+      { "show_text",
+        "_SilphCo11FSilphPresidentMasterBallDescriptionText" },              -- 9
     },
   },
 }
+
+-- Floors 2F-10F carry no other onEnter, so this repairs saves that beat
+-- Giovanni before the hide list existed (same shape as
+-- M.POKEMON_TOWER_7F.onEnter); 11F hides its own inside the table above.
+for _, floor in ipairs(SILPH_ROCKET_OBJECTS) do
+  local mapId = floor[1]
+  if mapId ~= "SILPH_CO_11F" then
+    M[mapId] = M[mapId] or {}
+    M[mapId].onEnter = function(game, ow)
+      if game.save.flags.EVENT_BEAT_SILPH_CO_GIOVANNI then
+        silphRocketsLeave(game, ow, mapId)
+      end
+    end
+  end
+end
 
 -- -------------------------------------------------------------------
 -- Victory Road boulder switches (scripts/VictoryRoad1F/2F/3F.asm):
@@ -719,11 +918,20 @@ local function boulderAt(ow, x, y)
   return npc and npc.def.sprite == "SPRITE_BOULDER" and npc or nil
 end
 
+-- Each barrier is stamped BOTH ways on entry.  pokered only ever stamps the
+-- OPEN block (ReplaceTileBlock edits the loaded block map, which the next map
+-- load throws away, so a fresh entry always shows the .blk's closed barrier),
+-- but OverworldState:replaceBlock writes through Map:setBlock into the SHARED
+-- map record in Game.data, so the port has to put the closed block back
+-- itself or a solved barrier stays open for the rest of the session (#258).
+-- The closed ids are the shipped .blk bytes: VictoryRoad1F.blk (4,6) = $25,
+-- VictoryRoad2F.blk (3,4) = $37 and (11,7) = $25, VictoryRoad3F.blk
+-- (3,5) = $25.  Same both-ways pattern as the card-key doors in
+-- OverworldState:setMap.
 M.VICTORY_ROAD_1F = {
   onEnter = function(game, ow)
-    if game.save.flags.EVENT_VICTORY_ROAD_1_BOULDER_ON_SWITCH then
-      ow:replaceBlock(4, 6, 0x1D)
-    end
+    ow:replaceBlock(4, 6,
+      game.save.flags.EVENT_VICTORY_ROAD_1_BOULDER_ON_SWITCH and 0x1D or 0x25)
   end,
   onBoulderMoved = function(game, ow, npc)
     if npc.cellX == 17 and npc.cellY == 13
@@ -736,12 +944,14 @@ M.VICTORY_ROAD_1F = {
 
 M.VICTORY_ROAD_2F = {
   onEnter = function(game, ow)
-    if game.save.flags.EVENT_VICTORY_ROAD_2_BOULDER_ON_SWITCH1 then
-      ow:replaceBlock(3, 4, 0x15)
-    end
-    if game.save.flags.EVENT_VICTORY_ROAD_2_BOULDER_ON_SWITCH2 then
-      ow:replaceBlock(11, 7, 0x1D)
-    end
+    -- VictoryRoad2FResetBoulderEventScript (scripts/VictoryRoad2F.asm:19):
+    -- entering 2F clears the 1F switch event, so 1F's barrier is closed
+    -- again the next time you climb down (#258)
+    game.save.flags.EVENT_VICTORY_ROAD_1_BOULDER_ON_SWITCH = nil
+    ow:replaceBlock(3, 4,
+      game.save.flags.EVENT_VICTORY_ROAD_2_BOULDER_ON_SWITCH1 and 0x15 or 0x37)
+    ow:replaceBlock(11, 7,
+      game.save.flags.EVENT_VICTORY_ROAD_2_BOULDER_ON_SWITCH2 and 0x1D or 0x25)
   end,
   onBoulderMoved = function(game, ow, npc)
     if npc.cellX == 1 and npc.cellY == 16
@@ -759,9 +969,8 @@ M.VICTORY_ROAD_2F = {
 
 M.VICTORY_ROAD_3F = {
   onEnter = function(game, ow)
-    if game.save.flags.EVENT_VICTORY_ROAD_3_BOULDER_ON_SWITCH1 then
-      ow:replaceBlock(3, 5, 0x1D)
-    end
+    ow:replaceBlock(3, 5,
+      game.save.flags.EVENT_VICTORY_ROAD_3_BOULDER_ON_SWITCH1 and 0x1D or 0x25)
   end,
   onBoulderMoved = function(game, ow, npc)
     if npc.cellX == 3 and npc.cellY == 5
@@ -769,12 +978,23 @@ M.VICTORY_ROAD_3F = {
       game.save.flags.EVENT_VICTORY_ROAD_3_BOULDER_ON_SWITCH1 = true
       ow:replaceBlock(3, 5, 0x1D)
     end
-    -- the hole at (23,15): the boulder drops to 2F next to switch 2
-    if npc.cellX == 23 and npc.cellY == 15 then
+    -- the hole at (23,15): the boulder drops to 2F next to switch 2.
+    -- VictoryRoad3FDefaultScript .handle_hole gates the swap on
+    -- CheckAndSetEvent EVENT_VICTORY_ROAD_3_BOULDER_ON_SWITCH2, then
+    -- HideObject TOGGLE_VICTORY_ROAD_3F_BOULDER / ShowObject
+    -- TOGGLE_VICTORY_ROAD_2F_BOULDER.  Those two toggles are
+    -- VICTORYROAD3F_BOULDER4 and VICTORYROAD2F_BOULDER3
+    -- (data/maps/toggleable_objects.asm); the old "VICTORYROAD2F_BOULDER"
+    -- matched no object_event name, so the toggle landed under a key
+    -- objectVisible never reads: harmless only while nothing hid that
+    -- boulder, and fatal once Route 23's reset does (#258).
+    if npc.cellX == 23 and npc.cellY == 15
+       and not game.save.flags.EVENT_VICTORY_ROAD_3_BOULDER_ON_SWITCH2 then
+      game.save.flags.EVENT_VICTORY_ROAD_3_BOULDER_ON_SWITCH2 = true
       local Commands = require("src.script.Commands")
       local ctx = { save = game.save, overworld = ow, game = game }
       Commands.hide_object(ctx, "VICTORY_ROAD_3F", npc.def.name)
-      Commands.show_object(ctx, "VICTORY_ROAD_2F", "VICTORYROAD2F_BOULDER")
+      Commands.show_object(ctx, "VICTORY_ROAD_2F", "VICTORYROAD2F_BOULDER3")
     end
   end,
   -- scripts/VictoryRoad3F.asm VictoryRoad3FDefaultScript: the same hole
@@ -784,6 +1004,7 @@ M.VICTORY_ROAD_3F = {
   -- fall is onStep, not a collision block.
   onStep = function(game, ow, x, y)
     if x == 23 and y == 15 then
+      require("src.core.Sound").play(game.data, "Faint_Fall")
       ow:startWarpTo("VICTORY_ROAD_2F", 22, 16, ow.player.facing)
       return true
     end
@@ -822,40 +1043,64 @@ M.VICTORY_ROAD_3F = {
 local championsRoomRivalScript = {
   { "face_player" },                                        -- 1
   { "check_flag", "EVENT_BEAT_CHAMPION_RIVAL_THIS_RUN" },   -- 2
-  { "jump_if_true", 25 },                                   -- 3  past end
+  -- "end" rather than a row number past the tail: this script grew by a row
+  -- when the follow-Oak walk landed (#704), which silently turned the old
+  -- numeric 26 into a jump ONTO the closing HALL_OF_FAME warp instead of past
+  -- it, so a returning champion warped straight into the induction.
+  { "jump_if_true", "end" },                                -- 3
+  { "set_option", "animations", true },                     -- scripts/ChampionsRoom.asm:57
   { "show_text", "_ChampionsRoomRivalIntroText" },          -- 4
-  { "rival_battle", "OPP_RIVAL3", 1 },                      -- 5
-  { "jump_if_false", 25 },                                  -- 6  past end
-  { "set_flag", "EVENT_BEAT_CHAMPION_RIVAL_THIS_RUN" },     -- 7
-  { "set_flag", "EVENT_BEAT_CHAMPION_RIVAL" },              -- 8
+  -- ChampionsRoomRivalReadyToBattleScript plays MUSIC_FINAL_BATTLE after
+  -- the intro text, before the battle itself (#706); pushBattle's wipe-time
+  -- playBattle("final") then no-ops on the same song, so the theme stays
+  -- continuous into the fight
+  { "play_music", "Music_FinalBattle" },                    -- 5
+  { "rival_battle", "OPP_RIVAL3", 1 },                      -- 6
+  -- losing halts here; the numeric target this replaced pointed at the
+  -- closing warp, which inducted a player who had just lost the fight (#704)
+  { "jump_if_false", "end" },                               -- 7
+  { "set_flag", "EVENT_BEAT_CHAMPION_RIVAL_THIS_RUN" },     -- 8
+  { "set_flag", "EVENT_BEAT_CHAMPION_RIVAL" },              -- 9
   -- ChampionsRoomRivalDefeatedScript re-displays TEXT_CHAMPIONSROOM_RIVAL,
   -- whose text_asm takes the EVENT_BEAT_CHAMPION_RIVAL branch =
   -- _ChampionsRoomRivalAfterBattleText (the in-battle _RivalDefeatedText
   -- is the port's generic "<PLAYER> defeated BLUE!" engine line instead).
-  { "show_text", "_ChampionsRoomRivalAfterBattleText" },    -- 9
+  { "show_text", "_ChampionsRoomRivalAfterBattleText" },    -- 10
   -- ChampionsRoomOakArrivesScript: Music_Cities1AlternateTempo
   -- (Cities1, kept into HALL_OF_FAME like BIT_NO_MAP_MUSIC after
-  -- defeating RIVAL3), then Oak's "{PLAYER}!" + reveal + walk in
-  { "play_music", "Music_Cities1", { keep = true } },       -- 10
-  { "show_text", "_ChampionsRoomOakText" },                 -- 11
-  { "show_object", "CHAMPIONS_ROOM", "CHAMPIONSROOM_OAK" },  -- 12
-  { "move_npc", 2, "up", 5 },                               -- 13 OakEntranceAfterVictoryMovement
+  -- defeating RIVAL3), then Oak's "{PLAYER}!" + reveal + walk in.
+  -- audio/alternate_tempo.asm Music_Cities1AlternateTempo is not a plain
+  -- PlayMusic: it fades the current song out (wAudioFadeOutControl = 10),
+  -- waits 100 frames for the fade, then restarts Cities1 with channel 1
+  -- pointed at Music_Cities1_Ch1_AlternateTempo -- `tempo 232` where the
+  -- normal Music_Cities1_Ch1 opens `tempo 144`, i.e. the slower, heavier
+  -- reading of the town theme this scene is known for (#847).
+  { "fade_music", 10 },                                     -- 11
+  { "wait", 100 },                                          -- 12
+  { "play_music", "Music_Cities1", { keep = true, tempo = 232 } }, -- 13
+  { "show_text", "_ChampionsRoomOakText" },                 -- 14
+  { "show_object", "CHAMPIONS_ROOM", "CHAMPIONSROOM_OAK" },  -- 15
+  { "move_npc", 2, "up", 5 },                               -- 16 OakEntranceAfterVictoryMovement
   -- OakCongratulatesPlayerScript: rival faces left, Oak faces down
-  { "face_object", 1, "left" },                             -- 14
-  { "face_object", 2, "down" },                             -- 15
-  { "show_text", "_ChampionsRoomOakCongratulatesPlayerText" }, -- 16
+  { "face_object", 1, "left" },                             -- 17
+  { "face_object", 2, "down" },                             -- 18
+  { "load_player_starter_name" },
+  { "show_text", "_ChampionsRoomOakCongratulatesPlayerText" }, -- 19
   -- OakDisappointedWithRivalScript: Oak turns to the rival (right)
-  { "face_object", 2, "right" },                            -- 17
-  { "show_text", "_ChampionsRoomOakDisappointedWithRivalText" }, -- 18
+  { "face_object", 2, "right" },                            -- 20
+  { "show_text", "_ChampionsRoomOakDisappointedWithRivalText" }, -- 21
   -- OakComeWithMeScript: Oak faces down again, then exits up
-  { "face_object", 2, "down" },                             -- 19
-  { "show_text", "_ChampionsRoomOakComeWithMeText" },       -- 20
-  { "move_npc", 2, "up", 2 },                               -- 21 OakExitChampionsRoomMovement
-  { "hide_object", "CHAMPIONS_ROOM", "CHAMPIONSROOM_OAK" },  -- 22
+  { "face_object", 2, "down" },                             -- 22
+  { "show_text", "_ChampionsRoomOakComeWithMeText" },       -- 23
+  { "move_npc", 2, "up", 2 },                               -- 24 OakExitChampionsRoomMovement
+  { "hide_object", "CHAMPIONS_ROOM", "CHAMPIONSROOM_OAK" },  -- 25
+  -- scripts/ChampionsRoom.asm WalkToHallOfFame_RLEMovement
+  { "move_player", "left", 1 },
+  { "move_player", "up", 3 },                               -- 27
   -- hand the induction off to the HALL_OF_FAME room (consumed by its
   -- onEnter), then warp up into it (destWarp 1 lands at (4,7) facing up)
-  { "set_field", "pendingHallOfFame", true },               -- 23
-  { "warp", "HALL_OF_FAME", 4, 7, "up" },                   -- 24
+  { "set_field", "pendingHallOfFame", true },               -- 28
+  { "warp", "HALL_OF_FAME", 4, 7, "up" },                   -- 29
 }
 
 M.CHAMPIONS_ROOM = {
@@ -1007,18 +1252,26 @@ local function pokemonTower2FRivalScript(playerX)
     and TOWER_RIVAL_EXIT_DOWN_THEN_RIGHT
     or TOWER_RIVAL_EXIT_RIGHT_THEN_DOWN
   return {
-    { "face_player" },                                            -- 1
-    { "check_flag", "EVENT_BEAT_POKEMON_TOWER_RIVAL" },           -- 2
-    { "jump_if_true", 12 },                                       -- 3
-    { "show_text", "_PokemonTower2FRivalWhatBringsYouHereText" }, -- 4
-    { "rival_battle", "OPP_RIVAL2", 4 },                          -- 5
-    { "jump_if_false", "end" },                                   -- 6 loss: stay
-    { "set_flag", "EVENT_BEAT_POKEMON_TOWER_RIVAL" },             -- 7
-    { "show_text", "_PokemonTower2FRivalDefeatedText" },          -- 8
-    { "walk_npc", 1, exitDirs },                                  -- 9
-    { "hide_object", "POKEMON_TOWER_2F", "POKEMONTOWER2F_RIVAL" }, -- 10
-    { "jump", "end" },                                            -- 11
-    { "show_text", "_PokemonTower2FRivalHowsYourDexText" },       -- 12
+    { "face_player" },
+    { "check_flag", "EVENT_BEAT_POKEMON_TOWER_RIVAL" },
+    { "jump_if_true", "beaten" },
+    { "show_text", "_PokemonTower2FRivalWhatBringsYouHereText" },
+    -- .DefeatedText rides BIT_PRINT_END_BATTLE_TEXT, so it prints on the
+    -- battle screen -- scripts/PokemonTower2F.asm:145-150
+    { "save_end_battle_text", "_PokemonTower2FRivalDefeatedText" },
+    { "rival_battle", "OPP_RIVAL2", 4 },
+    { "jump_if_false", "end" },                                   -- loss: stay
+    { "set_flag", "EVENT_BEAT_POKEMON_TOWER_RIVAL" },
+    -- the win re-runs DisplayTextID on the beaten branch
+    -- scripts/PokemonTower2F.asm:72-75, :137-140
+    { "show_text", "_PokemonTower2FRivalHowsYourDexText" },
+    { "play_music", "Music_MeetRival", { start = "rival" } },
+    { "walk_npc", 1, exitDirs },
+    { "hide_object", "POKEMON_TOWER_2F", "POKEMONTOWER2F_RIVAL" },
+    { "play_default_music" },              -- scripts/PokemonTower2F.asm:124
+    { "jump", "end" },
+    { "label", "beaten" },
+    { "show_text", "_PokemonTower2FRivalHowsYourDexText" },
   }
 end
 

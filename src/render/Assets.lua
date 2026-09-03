@@ -4,9 +4,9 @@
 -- its own file without editing a single record, and one flush() drops
 -- every downstream cache for dev-mode hot reload.
 --
--- No loader installed means resolve() is the identity, which is what
--- keeps a mod-free boot (and every headless test) loading exactly the
--- paths it always did.
+-- No loader installed means resolve() is the identity.  The NX Blue/Yellow
+-- versioned-cache fallback lives in src/core/NxAssetOverlay.lua (installed
+-- once at boot on NX only), not here, so this module stays platform-free.
 
 local Assets = {}
 
@@ -14,6 +14,8 @@ local Assets = {}
 local cache = {}
 -- downstream caches that must empty when the search path changes
 local invalidators = {}
+-- optional GPU release hooks for session end (never run on hot reload flush)
+local releasers = {}
 
 -- The loader bridge: overrideOrder() yields mods highest-priority-first
 -- and derivedPath(rel) yields an existing save/mod-derived/<id>/<rel>.
@@ -29,18 +31,27 @@ local function exists(path)
 end
 Assets.exists = exists
 
--- an override dir shadows the generated cache; a transform's derived
--- output is the fallback under it, so hand-authored art beats generated
+-- Mod overrides win; on NX, Blue/Yellow then use the prefixed save-dir file;
+-- otherwise the caller's unprefixed path (Red / mounted overlay).
 function Assets.resolve(path)
-  local loader = Assets.loader
-  if not loader or type(path) ~= "string" then return path end
+  if type(path) ~= "string" then return path end
   if path:sub(1, #GENERATED) ~= GENERATED then return path end
+
   local rel = path:sub(#GENERATED + 1)
-  for _, mod in ipairs(loader:overrideOrder()) do
-    local candidate = mod.path .. "/overrides/" .. rel
-    if exists(candidate) then return candidate end
+  local loader = Assets.loader
+  if loader then
+    for _, mod in ipairs(loader:overrideOrder()) do
+      local candidate = mod.path .. "/overrides/" .. rel
+      if exists(candidate) then return candidate end
+    end
+    local derived = loader:derivedPath(rel)
+    if derived then return derived end
   end
-  return loader:derivedPath(rel) or path
+
+  -- NX Blue/Yellow: no rewrite here -- NxAssetOverlay (installed once at
+  -- boot on NX only) covers every loader globally, so this module stays
+  -- the mod-override choke point it always was.
+  return path
 end
 
 function Assets.image(path)
@@ -59,8 +70,18 @@ function Assets.imageData(path)
   return love.image.newImageData(Assets.resolve(path))
 end
 
-function Assets.register(invalidate)
-  invalidators[#invalidators + 1] = invalidate
+-- Register a cache invalidator, or { invalidate = fn, release = fn } when a
+-- module caches LOVE Images/Canvases and can eagerly free them at session end.
+-- release is optional and is NOT run on flush/invalidate (HotReload safe).
+-- MapLoader is the canonical split-hook example: invalidateAll clears tables
+-- without GPU release; releaseAll evicts every resident map renderer.
+function Assets.register(hooks)
+  if type(hooks) == "function" then
+    invalidators[#invalidators + 1] = hooks
+    return
+  end
+  if hooks.invalidate then invalidators[#invalidators + 1] = hooks.invalidate end
+  if hooks.release then releasers[#releasers + 1] = hooks.release end
 end
 
 -- hot reload's single entry point (20-developer-tooling): drop the central
@@ -72,6 +93,17 @@ function Assets.invalidate()
 end
 
 Assets.flush = Assets.invalidate
+
+-- In-process return-to-launcher / editor close: release central Images and
+-- run release hooks only.  Does not call invalidate hooks (MapLoader must
+-- keep invalidateAll separate from releaseAll).
+function Assets.releaseSession()
+  for _, img in pairs(cache) do
+    if img and img.release then pcall(img.release, img) end
+  end
+  cache = {}
+  for _, fn in ipairs(releasers) do pcall(fn) end
+end
 
 -- Loader:load hands over the live mod set once the merge is done.  Load
 -- order is priority ascending, so the search walks it backwards: the mod

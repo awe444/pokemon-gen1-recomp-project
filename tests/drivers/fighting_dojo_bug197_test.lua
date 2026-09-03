@@ -1,9 +1,10 @@
 -- Driver: Fighting Dojo Karate Master bundle (#197).
 -- Six sub-bugs live in FIGHTING_DOJO (scripts/FightingDojo.asm):
---   BUG1 no aggro   -- the master has no trainer header so range=0
+--   BUG1 gate       -- the master stops the player on the tile to his left
 --   BUG2 no speech  -- no won text + no prize dialogue after the win
 --   BUG3 wrong re-talk -- shows the pre-battle challenge, not the after line
---   BUG4 (verify)   -- the ball ask() is the Gen1 descriptor, not a dex entry
+--   BUG4 (verify)   -- the ball ask() is the Gen1 descriptor, shown after
+--                      the species' dex entry (DisplayPokedex)
 --   BUG5 both balls -- the chosen ball AND the other one both vanish; the
 --                      other should stay and give the "greedy" refusal
 --   BUG6 poster     -- the north-wall posters ("Enemies on every side!") are
@@ -112,21 +113,23 @@ return function(game)
   ------------------------------------------------------------------
   local hdr = game.data:trainerHeader("FightingDojo", 1)
   check(hdr ~= nil, "BUG1/2/3: Karate Master trainer header (index 1) exists")
-  check(hdr and (hdr.range or 0) > 0, "BUG1: master has a sight range")
+  check(hdr and (hdr.range or 0) == 0,
+    "BUG1: master relies on the exact-tile gate, not trainer sight")
   check(hdr and hdr.won ~= nil, "BUG2: master has a won (defeat) text")
   check(hdr and hdr.after ~= nil, "BUG3: master has an after (re-talk) text")
 
   ------------------------------------------------------------------
-  -- BUG1: sight aggro.  Stand directly below the master (5,3 faces DOWN,
-  -- range 4) with the four blackbelts pre-cleared so only he can engage.
+  -- BUG1: exact gate. Start just north of the tile to the Master's left,
+  -- then step down once. The four blackbelts are cleared so only he reacts.
   ------------------------------------------------------------------
-  local ow = resetDojo(5, 4, "up", {})
+  local ow = resetDojo(4, 2, "down", {})
   U.shot(game, DIR .. "/dojo_1_before.png")
-  U.wait(20) -- the idle sight scan runs every frame
-  local engaged = ow.engaging or (ow.emote ~= nil)
-  U.log("aggro engaging:", tostring(ow.engaging), "emote:", tostring(ow.emote ~= nil))
+  U.tap(game, "down")
+  U.wait(30)
+  local engaged = topIsTextBox()
+  U.log("gate dialogue open:", tostring(engaged))
   U.shot(game, DIR .. "/dojo_2_aggro.png")
-  check(engaged, "BUG1: Karate Master aggros on sight")
+  check(engaged, "BUG1: Karate Master stops the player at his left")
 
   ------------------------------------------------------------------
   -- BUG3: talk to the already-beaten master -> "Stay and train..." and
@@ -161,8 +164,9 @@ return function(game)
   mashUntil(function() return game.stack:top() == ow end)
 
   ------------------------------------------------------------------
-  -- BUG4 (verify-only): the Hitmonlee ball prompt is the Gen1 descriptor
-  -- ("You want the hard kicking HITMONLEE?"), not a Pokedex entry screen.
+  -- BUG4 (verify-only): the Hitmonlee ball shows the species' Pokedex
+  -- entry first (DisplayPokedex, #853), then the Gen1 descriptor prompt
+  -- ("You want the hard kicking HITMONLEE?").
   ------------------------------------------------------------------
   ow = resetDojo(4, 2, "up", { EVENT_BEAT_KARATE_MASTER = true })
   local leeBall = npcByName(ow, "FIGHTINGDOJO_HITMONLEE_POKE_BALL")
@@ -171,7 +175,7 @@ return function(game)
   if leeBall then
     ow:talkTo(leeBall)
     check(sawText("hard kicking") or sawText("HITMONLEE"),
-      "BUG4: ball asks the Gen1 descriptor prompt (no dex entry)")
+      "BUG4: ball asks the Gen1 descriptor prompt after the dex entry")
     U.shot(game, DIR .. "/dojo_4_prompt.png")
     ------------------------------------------------------------------
     -- BUG5: choose YES -> only the chosen ball vanishes; the other stays

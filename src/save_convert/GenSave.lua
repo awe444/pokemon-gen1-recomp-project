@@ -23,10 +23,10 @@
 -- ORIGINAL imported bytes as a template when available (GenSave.decode
 -- stashes them) so that scratch state round-trips untouched instead of
 -- being invented; with no template (a save that originated in this
--- project) those bytes stay zero-filled, which is safe because the real
--- game regenerates all of it from wCurMap on the next map load anyway.
+-- project) src/save_convert/MapContext.lua rebuilds it (home/overworld.asm:2016).
 
 local bit = require("bit")
+local MapContext = require("src.save_convert.MapContext")
 
 local GenSave = {}
 
@@ -38,6 +38,8 @@ local NAME_LENGTH = 11
 local PARTY_LENGTH = 6
 local MONS_PER_BOX = 20
 local NUM_BADGES = 8
+local NUM_CITY_MAPS = 11     -- PALLET_TOWN..SAFFRON_CITY, the bit width of
+                              -- wTownVisitedFlag (constants/map_constants.asm)
 local BOX_STRUCT_SIZE = 33   -- Species,HP,Level,Status,Type1,Type2,CatchRate,
                               -- Moves x4,OTID,Exp x3,HPExp,AtkExp,DefExp,
                               -- SpdExp,SpcExp,DVs,PP x4 (macros/ram.asm box_struct)
@@ -65,7 +67,43 @@ O.numPcItems = O.mainData + 579                           -- 1B
 O.pcItems = O.mainData + 580                              -- 101B (50 x (id,qty) + $FF term)
 O.currentBoxNum = O.mainData + 681                        -- 1B (bits 0-6: box 0-11, bit 7: unused here)
 O.coins = O.mainData + 685                                -- 2B BCD
+-- wTownVisitedFlag (ram/wram.asm:2057): the FLY destination set, a
+-- flag_array NUM_CITY_MAPS whose bit index IS the town's map index (see the
+-- decode note).  Triangulated from both neighbours, which agree exactly:
+-- backwards from the checksum-covered, independently derived O.eventFlags
+-- below by summing every wram.asm declaration between the two labels --
+-- 2 (wTownVisitedFlag) + 2 (wSafariSteps) + 1 + 1 + 2 + 1 + 1 + 1 + 1 + 1
+-- + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 1 + 1 + 1 (wBeatGymFlags) + 1 + 1 + 1
+-- (wStatusFlags3, aliased wCableClubDestinationMap) + 1 + 1 + 1 + 1 + 1 + 1
+-- + 1 + 1 + 1 (wMovementFlags) + 2 + 2 + 1 + 1 + 2 + 1 + 1 + 2 + 1 + 1 + 2
+-- = 60, so 1104 - 60 = 1044; and forwards from O.coins (mainData + 685)
+-- with 2 (wPlayerCoins) + 32 (wToggleableObjectFlags, flag_array $100) + 7
+-- + 1 (wSavedSpriteImageIndex) + 33 (wToggleableObjectList) + 1 + 200
+-- (wGameProgressFlags..End) + 56 + 14 (wObtainedHiddenItemsFlags,
+-- flag_array MAX_HIDDEN_ITEMS = 112) + 2 (wObtainedHiddenCoinsFlags) + 1
+-- (wWalkBikeSurfState) + 10 = 359, so 685 + 359 = 1044 as well.
+O.townVisited = O.mainData + 1044                         -- 2B (flag_array NUM_CITY_MAPS)
 O.eventFlags = O.mainData + 1104                          -- 320B (flag_array NUM_EVENTS = 2560 bits)
+-- Progress bits vanilla keeps OUTSIDE wEventFlags that this port still spells
+-- as save.flags entries (#396).  Offsets walk forward from wTownVisitedFlag
+-- over the same ram/wram.asm declaration run the 60-byte gap above sums:
+-- +29 wStatusFlags1, +35 wStatusFlags4, +41 wElite4Flags,
+-- +44 wCompletedInGameTradeFlags.
+O.statusFlags1 = O.townVisited + 29                       -- 1B
+O.statusFlags4 = O.townVisited + 35                       -- 1B
+O.elite4Flags = O.townVisited + 41                        -- 1B
+O.tradeFlags = O.townVisited + 44                         -- 2B (flag_array NUM_NPC_TRADES)
+-- +10 wRivalStarter / +12 wPlayerStarter from the same run (ram/wram.asm:2057-2078;
+-- engine/debug/debug_party.asm:119 ASSERTs the spacing) (#1625)
+O.rivalStarter = O.townVisited + 10
+O.playerStarter = O.townVisited + 12
+-- wToggleableObjectFlags (ram/wram.asm, flag_array $100): the ShowObject/
+-- HideObject persistence, one bit per data/maps/toggleable_objects.asm entry,
+-- set = hidden (engine/overworld/toggleable_objects.asm IsObjectHidden).
+-- Sits 2 bytes (wPlayerCoins) past O.coins per the walk above; absolute
+-- 0x2852 (#763, #857).
+O.toggleObjectFlags = O.coins + 2                         -- 32B
+O.hiddenItemFlags = O.townVisited - 27
 -- Play time (wPlayTimeHours/Maxed/Minutes/Seconds/Frames) lives INSIDE the
 -- sMainData window (wMainDataStart..wMainDataEnd is copied verbatim into
 -- SRAM), 1866 bytes past wMainDataStart -- reached from the checksum-verified
@@ -80,6 +118,15 @@ O.playTimeMaxed = O.mainData + 1867                       -- 1B (set once past 2
 O.playTimeMinutes = O.mainData + 1868                     -- 1B (0-59)
 O.playTimeSeconds = O.mainData + 1869                     -- 1B (0-59)
 O.playTimeFrames = O.mainData + 1870                      -- 1B (0-59, 1/60s ticks)
+-- wPikachuHappiness, Yellow only (pret/pokeyellow ram/wram.asm; no local
+-- pokeyellow checkout, so verified against the pokeyellow symbol file
+-- instead: d46f - wMainDataStart d2f6 = 377, the well-known absolute
+-- 0x271C).  In Red/Blue this byte is current-map scratch the game
+-- regenerates on load, so the codec touches it only when the crosswalk
+-- data set names the game "yellow" (#763, #838).  Every other modeled
+-- offset is identical between pokered and pokeyellow (same sram.asm, same
+-- wMainData field spacing per both symbol files).
+O.pikachuHappiness = O.mainData + 377
 O.mainDataSize = 1929                                     -- wMainDataEnd - wMainDataStart
 
 O.spriteData = O.mainData + O.mainDataSize
@@ -104,6 +151,10 @@ O.boxMonNicks = O.boxMonOT + MONS_PER_BOX * NAME_LENGTH
 O.checksumStart = O.playerName
 O.checksumEnd = O.curBoxData + BOX_REGION_SIZE + 1        -- + sTileAnimations (1B)
 O.mainChecksum = O.checksumEnd                            -- 1B
+
+O.identityTag = 8192                                       -- ram/sram.asm:14
+GenSave.IDENTITY_MAGIC = "G1RC"
+GenSave.IDENTITY_ID_LENGTH = 32
 
 O.box1 = 16384                                             -- bank 2 start
 O.boxBank2Checksum = O.box1 + 6 * BOX_REGION_SIZE
@@ -163,6 +214,18 @@ local function checksum(bytes, from, to)
   return bit.band(bit.bnot(sum), 0xFF)
 end
 
+-- Main-data checksum gate used before an import policy is decided.  Returns
+-- nil when the buffer is too short to even carry the stored checksum byte
+-- (offset O.mainChecksum, the last byte of wMainData), false on a mismatch,
+-- true when it matches.  Works on any length >= O.mainChecksum + 1, so a
+-- caller can classify a truncated or footer-padded file without a full
+-- decode -- the checksummed region (0x2598..0x3522) always sits entirely
+-- inside the first 0x3524 bytes of a save.
+function GenSave.mainChecksumValid(bytes)
+  if #bytes < O.mainChecksum + 1 then return nil end
+  return checksum(bytes, O.checksumStart, O.checksumEnd) == u8(bytes, O.mainChecksum)
+end
+
 -- flag_array packs LSB-first within each byte (bit 0 of byte 0 = index 0).
 -- This is pokered's runtime FlagAction convention (home/predef macros): it
 -- takes flag number N, addresses byte N/8, and builds the mask by rotating
@@ -213,7 +276,7 @@ local function decodeName(bytes, off, len)
   return table.concat(out)
 end
 
-local function encodeName(buf, off, len, text)
+local function encodeName(buf, off, len, text, padTail)
   local i, pos = 0, 1
   while i < len - 1 and pos <= #text do
     -- a bracketed control token (e.g. "<DOT>", from decodeName reading a
@@ -232,12 +295,18 @@ local function encodeName(buf, off, len, text)
     setByte(buf, off + i, charmap.byToken[ch] or charmap.byToken["?"] or 0x50)
     i, pos = i + 1, pos + clen
   end
-  -- Write exactly ONE $50 terminator and then STOP. The bytes after it are
-  -- left untouched: when encoding over a template they stay as the original
-  -- save's post-terminator padding (so an unchanged name round-trips
-  -- byte-identical), and on a templateless export they stay zero-filled. The
-  -- game reads a name only up to the first $50, so whatever follows is inert.
+  -- Write exactly ONE $50 terminator.  The tail past it is $50-padded only
+  -- on a templateless (engine-origin) export, where the zero-filled buffer
+  -- is what PKHeX renders as garbage glyphs after the name ("JOHN{}", #206).
+  -- With a template the tail keeps the original save's bytes verbatim --
+  -- real cartridge saves legitimately hold 0x00 (and other stale glyph)
+  -- bytes after the terminator, and rewriting any of them broke the
+  -- import->export byte-identical round trip (the game and PKHeX both stop
+  -- reading at the terminator, so preserved tails are always safe).
   if i < len then setByte(buf, off + i, 0x50) end
+  if padTail then
+    for j = i + 1, len - 1 do setByte(buf, off + j, 0x50) end
+  end
 end
 
 -- ------------------------------------------------------------------
@@ -291,6 +360,46 @@ local BADGE_BY_BIT = {
 local BADGE_BY_BIT_SET = {}
 for _, name in pairs(BADGE_BY_BIT) do BADGE_BY_BIT_SET[name] = true end
 
+-- save.flags names whose vanilla home is NOT wEventFlags (#396: exporting a
+-- save and importing it back made the Saffron gate guards thirsty again,
+-- because BIT_GAVE_SAFFRON_GUARDS_DRINK is a wStatusFlags1 bit and nothing
+-- carried it).  Bit numbers are constants/ram_constants.asm; the trade bits
+-- are wWhichTrade, which engine/events/in_game_trades.asm uses to index
+-- wCompletedInGameTradeFlags, i.e. the data/events/trades.asm row order the
+-- port's `trade` command takes 1-based.
+local EXTRA_FLAG_BITS = {
+  EVENT_GOT_OLD_ROD       = { O.statusFlags1, 3 },
+  EVENT_GOT_GOOD_ROD      = { O.statusFlags1, 4 },
+  EVENT_GOT_SUPER_ROD     = { O.statusFlags1, 5 },
+  EVENT_GAVE_GUARDS_DRINK = { O.statusFlags1, 6 },
+  EVENT_GOT_LAPRAS        = { O.statusFlags4, 0 },
+  EVENT_STARTED_ELITE_4   = { O.elite4Flags, 1 },
+  EVENT_TRADED_NIDORINO_FOR_NIDORINA   = { O.tradeFlags, 0 },
+  EVENT_TRADED_ABRA_FOR_MR_MIME        = { O.tradeFlags, 1 },
+  EVENT_TRADED_PONYTA_FOR_SEEL         = { O.tradeFlags, 3 },
+  EVENT_TRADED_SPEAROW_FOR_FARFETCHD   = { O.tradeFlags, 4 },
+  EVENT_TRADED_SLOWBRO_FOR_LICKITUNG   = { O.tradeFlags, 5 },
+  EVENT_TRADED_POLIWHIRL_FOR_JYNX      = { O.tradeFlags, 6 },
+  EVENT_TRADED_RAICHU_FOR_ELECTRODE    = { O.tradeFlags, 7 },
+  EVENT_TRADED_VENONAT_FOR_TANGELA     = { O.tradeFlags, 8 },
+  EVENT_TRADED_NIDORAN_M_FOR_NIDORAN_F = { O.tradeFlags, 9 },
+}
+
+-- port-local name -> the wEventFlags name it means (#396)
+local FLAG_ALIAS = {
+  EVENT_RECEIVED_BIKE_VOUCHER = "EVENT_GOT_BIKE_VOUCHER",
+  EVENT_GOT_HM_FLASH = "EVENT_GOT_HM05",
+}
+
+-- scripts/OaksLab.asm:797-825
+local PLAYER_TO_RIVAL = {
+  CHARMANDER = "SQUIRTLE", SQUIRTLE = "BULBASAUR", BULBASAUR = "CHARMANDER",
+}
+local RIVAL_TO_PLAYER = {}
+for player, rival in pairs(PLAYER_TO_RIVAL) do RIVAL_TO_PLAYER[rival] = player end
+-- pokeyellow scripts/OaksLab.asm:1020 (wPlayerStarter) and :231/:381
+local YELLOW_STARTER = "PIKACHU"
+
 -- STATUS_* bits (constants/battle_constants.asm): 0-2 sleep-turns-left,
 -- 3 PSN, 4 BRN, 5 FRZ, 6 PAR
 local STATUS_BIT = { PSN = 3, BRN = 4, FRZ = 5, PAR = 6 }
@@ -307,10 +416,14 @@ local function encodeStatus(status)
   return 0
 end
 
+-- Def rows share a generated table's top level with provenance scalars on
+-- some data sets (src/import/RomExtractorGen2.lua stamps `generation` and
+-- `source` beside the entries), so every pairs(defs) walk here must keep
+-- to table rows: indexing a scalar row raises instead of skipping it.
 local function buildIndexCrosswalk(defs)
   local byIndex, byId = {}, {}
   for id, def in pairs(defs or {}) do
-    if def.index ~= nil then
+    if type(def) == "table" and def.index ~= nil then
       byIndex[def.index] = id
       byId[id] = def.index
     end
@@ -331,7 +444,8 @@ end
 local function buildDexCrosswalk(defs)
   local byDex, dexOf = {}, {}
   for id, def in pairs(defs or {}) do
-    local n = def.source and tonumber(def.source:match("BaseStats%[(%d+)%]"))
+    local n = type(def) == "table" and def.source
+      and tonumber(def.source:match("BaseStats%[(%d+)%]"))
     if n then
       byDex[n] = id
       dexOf[id] = n
@@ -349,7 +463,8 @@ end
 -- per slot -- i.e. HM01=196+.. , TM01=201+(number-1).
 local function addMachineIndices(defs, byIndex, byId)
   for id, def in pairs(defs or {}) do
-    if byId[id] == nil and def.machine and def.machine.number then
+    if type(def) == "table" and byId[id] == nil
+       and def.machine and def.machine.number then
       local base = def.machine.kind == "HM" and 195 or 200
       local idx = base + def.machine.number
       byIndex[idx] = id
@@ -373,6 +488,40 @@ function GenSave.crosswalks(data)
     mapsByIndex = mapsByIndex, mapsIndex = mapsIndex,
     speciesDefs = data.pokemon or {},
   }
+end
+
+-- Gen1 has no "is nicknamed" bit.  An un-nicknamed mon literally stores its
+-- species' standard name in the nickname slot: engine/menus/naming_screen.asm
+-- AskName's .declinedNickname copies wNameBuffer (the MonsterNames entry
+-- GetMonName just loaded) straight over the mon's nickname field.  The game
+-- recovers "was it nicknamed?" by comparing the two --
+-- engine/pokemon/evos_moves.asm RenameEvolvedMon rewrites the name on
+-- evolution only while the stored one still equals the PRE-evolution
+-- species' standard name ("Renames the mon to its new, evolved form's
+-- standard name unless it had a nickname, in which case the nickname is
+-- kept").  This project models that state as mon.nickname == nil instead:
+-- every display site reads `mon.nickname or def.name` and
+-- src/pokemon/Evolution.lua deliberately never touches the field.  So the
+-- two conventions must be translated at this boundary, or an imported
+-- SQUIRTLE still reads "SQUIRTLE" after it becomes a WARTORTLE and an
+-- engine-origin export writes the species CONSTANT ("NIDORAN_M", whose "_"
+-- has no charmap glyph and encodes as "?") where the cartridge keeps the
+-- display name.  Both read back as a forced nickname (#257).
+--
+-- def.name is byte-for-byte what the cartridge stores: tools/extract/
+-- pokemon.py parse_names reads pokered's data/pokemon/names.asm, the very
+-- table GetMonName loads from, and all 151 names round-trip exactly through
+-- src/save_convert/data/charmap.lua, so the equality test below is exact
+-- and never mis-fires on a name the charmap mangles.
+local function speciesName(cw, species)
+  local def = species and cw.speciesDefs[species]
+  return (def and def.name) or species or ""
+end
+
+-- stored fixed-length name -> save.lua nickname (nil when never nicknamed)
+local function importedNickname(cw, species, stored)
+  if stored == speciesName(cw, species) then return nil end
+  return stored
 end
 
 -- ------------------------------------------------------------------
@@ -531,7 +680,7 @@ function GenSave.decode(bytes, data, opts)
   end
 
   local save = {
-    meta = { format = "gen1_import" },
+    meta = { format = "gen1_import", playthroughId = GenSave.readIdentity(bytes) },
     player = {
       name = decodeName(bytes, O.playerName, NAME_LENGTH),
       rival = decodeName(bytes, O.rivalName, NAME_LENGTH),
@@ -573,7 +722,10 @@ function GenSave.decode(bytes, data, opts)
     local mon = decodeMon(bytes, O.partyMons + i * PARTY_STRUCT_SIZE, true, cw)
     if mon then
       mon.ot = decodeName(bytes, O.partyMonOT + i * NAME_LENGTH, NAME_LENGTH)
-      mon.nickname = decodeName(bytes, O.partyMonNicks + i * NAME_LENGTH, NAME_LENGTH)
+      -- a stored name equal to the species' standard name means NOT
+      -- nicknamed, which this project spells as nil (#257)
+      mon.nickname = importedNickname(cw, mon.species,
+        decodeName(bytes, O.partyMonNicks + i * NAME_LENGTH, NAME_LENGTH))
       save.party[#save.party + 1] = mon
     end
   end
@@ -586,7 +738,8 @@ function GenSave.decode(bytes, data, opts)
       local mon = decodeMon(bytes, base + 22 + i * BOX_STRUCT_SIZE, false, cw)
       if mon then
         mon.ot = decodeName(bytes, base + 22 + MONS_PER_BOX * BOX_STRUCT_SIZE + i * NAME_LENGTH, NAME_LENGTH)
-        mon.nickname = decodeName(bytes, base + 22 + MONS_PER_BOX * (BOX_STRUCT_SIZE + NAME_LENGTH) + i * NAME_LENGTH, NAME_LENGTH)
+        mon.nickname = importedNickname(cw, mon.species,
+          decodeName(bytes, base + 22 + MONS_PER_BOX * (BOX_STRUCT_SIZE + NAME_LENGTH) + i * NAME_LENGTH, NAME_LENGTH))
         table.insert(save.boxes[boxNum], mon)
       end
     end
@@ -607,6 +760,83 @@ function GenSave.decode(bytes, data, opts)
   if events then
     for bitIdx, name in pairs(events.byBit) do
       if bitGet(bytes, O.eventFlags, bitIdx) then save.flags[name] = true end
+    end
+  end
+
+  -- the same progress under names that are not wEventFlags bits (#396)
+  for name, spec in pairs(EXTRA_FLAG_BITS) do
+    if bitGet(bytes, spec[1], spec[2]) then save.flags[name] = true end
+  end
+  for portName, vanillaName in pairs(FLAG_ALIAS) do
+    if save.flags[vanillaName] then save.flags[portName] = true end
+  end
+
+  -- scripts/OaksLab.asm:335, :900-901
+  if save.flags.EVENT_GOT_STARTER then
+    local chosen = cw.pokemonByIndex[u8(bytes, O.playerStarter)]
+    if data.gameVersion == "yellow" then
+      if chosen ~= YELLOW_STARTER then chosen = nil end
+    elseif not PLAYER_TO_RIVAL[chosen or ""] then
+      chosen = RIVAL_TO_PLAYER[cw.pokemonByIndex[u8(bytes, O.rivalStarter)] or ""]
+    end
+    if chosen then
+      save.flags["EVENT_CHOSE_" .. chosen] = true
+    else
+      warn("no starter recorded in the save; rival parties will default")
+    end
+  end
+  if data.gameVersion == "yellow" then
+    local rival = u8(bytes, O.rivalStarter)
+    if rival >= 1 and rival <= 3 then save.rivalStarter = rival end
+  end
+
+  -- wToggleableObjectFlags -> save.objectToggles (bit set = hidden).  A few
+  -- of these are re-derived from flags on map entry (#106/#234 onEnter
+  -- re-applies), but most ShowObject/HideObject state -- the Mt Moon
+  -- fossils, the Cerulean guard swap -- has no flag to re-derive from, so
+  -- an import that drops the array resurrects taken fossils and blocking
+  -- guards (#763, #857).
+  local toggles = data.toggleObjects
+  if toggles then
+    save.objectToggles = {}
+    for bitIdx, e in pairs(toggles.byBit) do
+      local mapToggles = save.objectToggles[e[1]]
+      if not mapToggles then
+        mapToggles = {}
+        save.objectToggles[e[1]] = mapToggles
+      end
+      mapToggles[e[2]] = not bitGet(bytes, O.toggleObjectFlags, bitIdx)
+    end
+  end
+
+  if data.hiddenItems then
+    save.hiddenTaken = {}
+    for i, row in ipairs(data.hiddenItems) do
+      if bitGet(bytes, O.hiddenItemFlags, i - 1) then
+        save.hiddenTaken[row[1] .. "_" .. row[2] .. "_" .. row[3]] = true
+      end
+    end
+  end
+
+  -- FLY destinations.  wTownVisitedFlag's bit index IS the town's map index:
+  -- engine/items/town_map.asm BuildFlyLocationsList loads the 16-bit value
+  -- into de and rotates it right one bit per iteration with b counting up
+  -- from 0, storing b ("the map number of the town if it has been visited"),
+  -- so bit 0 = map 0 = PALLET_TOWN, LSB first; and
+  -- engine/overworld/toggleable_objects.asm
+  -- MarkTownVisitedAndLoadToggleableObjects sets bit [wCurMap] on entry for
+  -- any map below FIRST_ROUTE_MAP.  Map indices 0-10 in
+  -- data/generated/maps.lua match PALLET_TOWN..SAFFRON_CITY one for one.
+  -- This project keeps the same set as save.visited[mapId]
+  -- (src/ui/FlyMenu.lua, src/ui/TownMap.lua, and the only writer,
+  -- src/world/OverworldController.lua's mark-on-map-entry), which an import
+  -- used to leave nil: FLY then listed only the town the player happened to
+  -- be standing in when the save was loaded (#263).
+  save.visited = {}
+  for townIdx = 0, NUM_CITY_MAPS - 1 do
+    if bitGet(bytes, O.townVisited, townIdx) then
+      local townId = cw.mapsByIndex[townIdx]
+      if townId then save.visited[townId] = true end
     end
   end
 
@@ -633,6 +863,15 @@ function GenSave.decode(bytes, data, opts)
                 + u8(bytes, O.playTimeSeconds)
                 + u8(bytes, O.playTimeFrames) / 60
 
+  -- Yellow starter friendship (save.pikachuHappiness,
+  -- src/world/PikachuFollower.lua reads it; pokeyellow's
+  -- init_player_data.asm seeds 90 on a new game), gated on the data set's
+  -- game because the byte is map scratch in Red/Blue (see
+  -- O.pikachuHappiness) (#763, #838).
+  if data.gameVersion == "yellow" then
+    save.pikachuHappiness = u8(bytes, O.pikachuHappiness)
+  end
+
   save.warnings = warnings
   save.rawImport = bytes -- template for a later encode(); see file header
   return save
@@ -641,6 +880,23 @@ end
 -- ------------------------------------------------------------------
 -- encode: save.lua-shaped table -> raw 32768-byte SRAM string
 -- ------------------------------------------------------------------
+
+local function identityOf(save)
+  local meta = type(save) == "table" and save.meta
+  local id = type(meta) == "table" and meta.playthroughId
+  if type(id) ~= "string" or #id ~= GenSave.IDENTITY_ID_LENGTH then return nil end
+  if not id:match("^%x+$") then return nil end
+  return id
+end
+
+function GenSave.readIdentity(bytes)
+  if type(bytes) ~= "string" or #bytes < GenSave.SAVE_SIZE then return nil end
+  local off = O.identityTag
+  local magic = GenSave.IDENTITY_MAGIC
+  if bytes:sub(off + 1, off + #magic) ~= magic then return nil end
+  return identityOf({ meta = { playthroughId =
+    bytes:sub(off + #magic + 1, off + #magic + GenSave.IDENTITY_ID_LENGTH) } })
+end
 
 function GenSave.encode(save, data, template)
   local cw = GenSave.crosswalks(data)
@@ -653,9 +909,29 @@ function GenSave.encode(save, data, template)
     for i = 1, GenSave.SAVE_SIZE do buf[i] = zero end
   end
 
-  encodeName(buf, O.playerName, NAME_LENGTH, (save.player and save.player.name) or "RED")
-  encodeName(buf, O.rivalName, NAME_LENGTH, (save.player and save.player.rival) or "BLUE")
+  local identity = identityOf(save)
+  if identity then
+    local tag = GenSave.IDENTITY_MAGIC .. identity
+    for i = 1, #tag do buf[O.identityTag + i] = tag:sub(i, i) end
+  end
+
+  local padTail = not src
+  encodeName(buf, O.playerName, NAME_LENGTH, (save.player and save.player.name) or "RED", padTail)
+  encodeName(buf, O.rivalName, NAME_LENGTH, (save.player and save.player.rival) or "BLUE", padTail)
   setU16be(buf, O.playerId, (save.player and save.player.id) or 0)
+  -- wOptions (engine/menus/main_menu.asm InitOptions): bit 7 = battle
+  -- effects OFF, bit 6 = SET style, bits 2-0 = text speed -- the recomp's
+  -- textSpeed 1/3/5 are pokered's exact FAST/MEDIUM/SLOW values
+  -- (SaveData.defaultOptions).  Templateless exports only: with a
+  -- template the byte survives untouched (the round-trip invariant), and
+  -- decode() never reads it back anyway.
+  if not src then
+    local opts = save.options or {}
+    local ob = (tonumber(opts.textSpeed) or 3) % 8
+    if opts.battleStyle == "set" then ob = bit.bor(ob, 0x40) end
+    if opts.animations == false then ob = bit.bor(ob, 0x80) end
+    setByte(buf, O.options, ob)
+  end
   setBcd(buf, O.money, 3, math.min(save.money or 0, 999999))
   setBcd(buf, O.coins, 2, math.min(save.coins or 0, 9999))
 
@@ -698,6 +974,92 @@ function GenSave.encode(save, data, template)
       local bitIdx = events.byName[name]
       if bitIdx then bitSet(buf, O.eventFlags, bitIdx, true) end
     end
+    for portName, vanillaName in pairs(FLAG_ALIAS) do
+      local bitIdx = events.byName[vanillaName]
+      if bitIdx and save.flags[portName] then bitSet(buf, O.eventFlags, bitIdx, true) end
+    end
+  end
+
+  -- Non-wEventFlags progress, written both ways: this port's save is the only
+  -- authority for these names, so a flag it does not hold must clear the
+  -- template's bit rather than survive in the export (#396).
+  if save.flags then
+    for name, spec in pairs(EXTRA_FLAG_BITS) do
+      bitSet(buf, spec[1], spec[2], save.flags[name] and true or false)
+    end
+  end
+
+  -- scripts/OaksLab.asm:322-323, :900-901
+  if data.gameVersion == "yellow" then
+    if save.flags and save.flags["EVENT_CHOSE_" .. YELLOW_STARTER] then
+      setByte(buf, O.playerStarter, cw.pokemonIndex[YELLOW_STARTER] or 0)
+    end
+    local rival = tonumber(save.rivalStarter)
+    if rival and rival >= 1 and rival <= 3 then
+      setByte(buf, O.rivalStarter, rival)
+    end
+  elseif save.flags then
+    for species, rival in pairs(PLAYER_TO_RIVAL) do
+      if save.flags["EVENT_CHOSE_" .. species] then
+        setByte(buf, O.playerStarter, cw.pokemonIndex[species] or 0)
+        setByte(buf, O.rivalStarter, cw.pokemonIndex[rival] or 0)
+      end
+    end
+  end
+
+  -- wToggleableObjectFlags, written both ways like the #396 extras: this
+  -- port's save is the authority, and vanilla folds three stores this port
+  -- keeps separate into these same bits -- script ShowObject/HideObject
+  -- (save.objectToggles), taken overworld items (engine/events/
+  -- pick_up_item.asm -> save.itemsTaken) and beaten static encounters
+  -- (home/trainers.asm HideObject after battle -> save.defeatedTrainers) --
+  -- so all three fold back in here or an exported save resurrects them
+  -- (#763, #857).
+  local toggleData = data.toggleObjects
+  if toggleData then
+    local objectToggles = save.objectToggles or {}
+    local itemsTaken = save.itemsTaken or {}
+    local beaten = save.defeatedTrainers or {}
+    for bitIdx, e in pairs(toggleData.byBit) do
+      local mapId, objName, visible = e[1], e[2], e[3]
+      local mapToggles = objectToggles[mapId]
+      if mapToggles and mapToggles[objName] ~= nil then
+        visible = mapToggles[objName]
+      end
+      if visible and data.maps and data.maps[mapId] then
+        for _, obj in ipairs(data.maps[mapId].objects or {}) do
+          if obj.name == objName then
+            local key = mapId .. "_obj_" .. obj.index
+            if (obj.item and itemsTaken[key])
+               or (obj.pokemon and beaten[key]) then
+              visible = false
+            end
+            break
+          end
+        end
+      end
+      bitSet(buf, O.toggleObjectFlags, bitIdx, not visible)
+    end
+  end
+
+  if data.hiddenItems then
+    local taken = save.hiddenTaken or {}
+    for i, row in ipairs(data.hiddenItems) do
+      local key = row[1] .. "_" .. row[2] .. "_" .. row[3]
+      bitSet(buf, O.hiddenItemFlags, i - 1, taken[key] and true or false)
+    end
+  end
+
+  -- FLY destinations back into wTownVisitedFlag (see the decode note), so a
+  -- save exported from this port is flyable on hardware (#263).  A save
+  -- table with no `visited` key at all says nothing about the set, so leave
+  -- the template's bits exactly as they are rather than blanking every town.
+  if type(save.visited) == "table" then
+    for townIdx = 0, NUM_CITY_MAPS - 1 do
+      local townId = cw.mapsByIndex[townIdx]
+      bitSet(buf, O.townVisited, townIdx,
+             (townId and save.visited[townId]) and true or false)
+    end
   end
 
   -- party
@@ -709,9 +1071,11 @@ function GenSave.encode(save, data, template)
     encodeMon(buf, O.partyMons + i * PARTY_STRUCT_SIZE, mon, true, cw)
     setByte(buf, O.partySpecies + i, cw.pokemonIndex[mon.species] or 0)
     encodeName(buf, O.partyMonOT + i * NAME_LENGTH, NAME_LENGTH,
-              mon.ot or (save.player and save.player.name) or "RED")
+              mon.ot or (save.player and save.player.name) or "RED", padTail)
+    -- no nickname stores the species' DISPLAY name, not its ROM constant id
+    -- ("NIDORAN_M" would charmap the "_" to "?") (#257)
     encodeName(buf, O.partyMonNicks + i * NAME_LENGTH, NAME_LENGTH,
-              mon.nickname or mon.species or "")
+              mon.nickname or speciesName(cw, mon.species), padTail)
   end
   -- $FF-terminate the species index list right after the last real mon. The
   -- struct, OT-name and nickname bytes of the empty slots past partyN are left
@@ -732,9 +1096,9 @@ function GenSave.encode(save, data, template)
       encodeMon(buf, base + 22 + i * BOX_STRUCT_SIZE, mon, false, cw)
       setByte(buf, base + 1 + i, cw.pokemonIndex[mon.species] or 0)
       encodeName(buf, base + 22 + MONS_PER_BOX * BOX_STRUCT_SIZE + i * NAME_LENGTH, NAME_LENGTH,
-                mon.ot or (save.player and save.player.name) or "RED")
+                mon.ot or (save.player and save.player.name) or "RED", padTail)
       encodeName(buf, base + 22 + MONS_PER_BOX * (BOX_STRUCT_SIZE + NAME_LENGTH) + i * NAME_LENGTH, NAME_LENGTH,
-                mon.nickname or mon.species or "")
+                mon.nickname or speciesName(cw, mon.species), padTail)  -- #257, as above
     end
     -- $FF-terminate the species list after the last real mon; empty slots past
     -- n keep their template bytes (byte-identical round-trip) or zero (fresh
@@ -763,6 +1127,45 @@ function GenSave.encode(save, data, template)
     setByte(buf, O.lastMap, cw.mapsIndex[save.lastOutdoor.id] or 0)
   end
 
+  -- Current-map engine state (see src/save_convert/MapContext.lua).  A
+  -- Continue restores this window from the save and never rebuilds it, so a
+  -- zero-filled one boots into a garbled map on a silent hang (#889).
+  --
+  -- Rebuilt when there is no template at all (a save that began as a New Game
+  -- in this port), and when the template was saved on a DIFFERENT map than the
+  -- one the player is standing on now -- an imported save that has since been
+  -- played carries the old map's header, which is just as unbootable.  A
+  -- template still on its own map keeps its bytes untouched: they are the
+  -- game's own, including live NPC positions, and preserving them is what
+  -- makes import -> export byte-identical.
+  local mapId = save.player and save.player.map
+  if mapId then
+    local rebuild = true
+    if src then
+      -- compare the way the byte was written (masked), and rebuild when the
+      -- map has no index at all rather than trusting a stale template
+      local index = cw.mapsIndex[mapId]
+      rebuild = index == nil or u8(src, O.curMap) ~= bit.band(index, 0xFF)
+    end
+    if rebuild then
+      local ctx, why = MapContext.build(data, mapId,
+        (save.player and save.player.x) or 0, (save.player and save.player.y) or 0)
+      -- home/overworld.asm:2016 (#1691)
+      if not ctx then
+        error(("this save cannot be exported: %s"):format(tostring(why)), 0)
+      end
+      for offset, values in pairs(ctx.writes) do
+        for i, value in ipairs(values) do
+          setByte(buf, O.mainData + offset + i - 1, value)
+        end
+      end
+      for i, value in ipairs(ctx.spriteData) do
+        setByte(buf, O.spriteData + i - 1, value)
+      end
+      setByte(buf, O.checksumEnd - 1, ctx.tileAnimations)
+    end
+  end
+
   -- play time: split save.playTime (seconds) back into H/M/S/F. The real
   -- game freezes the clock at 255h and sets wPlayTimeMaxed once past it, so
   -- mirror that cap rather than letting hours overflow a single byte.
@@ -783,6 +1186,16 @@ function GenSave.encode(save, data, template)
     setByte(buf, O.playTimeMinutes, mins)
     setByte(buf, O.playTimeSeconds, secs)
     setByte(buf, O.playTimeFrames, rem - secs * 60)
+  end
+
+  -- Yellow starter friendship back out (see O.pikachuHappiness); Red/Blue
+  -- data sets never reach this write.  90 is the fresh-game seed the
+  -- follower system itself uses when the save has never tracked it.
+  -- Placed before the checksum pass so the byte is covered by the
+  -- main-data checksum automatically (#763, #838).
+  if data.gameVersion == "yellow" then
+    local h = tonumber(save.pikachuHappiness) or 90
+    setByte(buf, O.pikachuHappiness, math.max(0, math.min(255, math.floor(h))))
   end
 
   local out = table.concat(buf)

@@ -1,225 +1,393 @@
--- Items panel: money, the 20-slot bag (Bag.add/remove, ordered by
--- Bag.order), gym badges (boolean flags on inventory), and PC Item
--- storage (a plain S.save.pcItems dict, created on first use).
+-- Items panel: money, the shared item picker, badges, the configurable bag
+-- (Bag.add/remove, ordered by Bag.order) and PC item storage (a plain
+-- S.save.pcItems dict with no slot cap).
+--
+-- The picker is a searchable list rather than the old pair of arrows that
+-- cycled one id at a time through ~250 items, which was the single worst
+-- interaction in the editor.  It scrolls under the mouse wheel too (#595):
+-- typing used to be the only way to reach an id past the first screenful.
+-- Badges sit in the wallet column as toggle chips because they are boolean
+-- inventory flags, not stackable items, and must not look like quantity rows.
+--
+-- #715 reflow: side by side the wallet column plus the two quantity lists
+-- need about 900 real px (a quantity row's -/+/x cluster alone is ~110px).
+-- Below that the five cards stack in one full-width column that scrolls in
+-- pixels (Kit.scrollPixels); the inner lists keep their own wheel/drag
+-- regions, which claim the notch first when the pointer is over them.
 
 local Bag = require("src.inventory.Bag")
+local Theme = require("Theme")
+local Ops = require("Ops")
+local Gen = require("Gen")
+local PAL = Theme.PAL
 
 local M = {}
 
-local ROW_H = 20
-local LIST_H = 200
-local VISIBLE_ROWS = math.floor(LIST_H / ROW_H)
+local MONEY_STEPS = { -1000, -100, 100, 1000 }
+local COIN_STEPS = { -100, -10, 10, 100 }
 
-local function mark(S)
-  S.dirty = true
+-- One quantity row shape, shared by the bag and the PC list: id, qty, then
+local function quantityRow(S, Kit, x, y, w, h, id, qty, selected, onMinus, onPlus,
+    onMax, canMax, onDrop)
+  local s = Kit.scale
+  local clicked = Kit.row(x, y, w, h, selected, PAL.blue, 9 * s)
+  local btn = 24 * s
+  local bx = x + w - 10 * s - 4 * btn - 3 * (6 * s)
+  if Kit.stepper(bx, y + (h - btn) / 2, btn, btn, "-", { font = "small" }) then
+    onMinus()
+  end
+  if Kit.stepper(bx + btn + 6 * s, y + (h - btn) / 2, btn, btn, "+",
+      { font = "small" }) then
+    onPlus()
+  end
+  if Kit.stepper(bx + 2 * (btn + 6 * s), y + (h - btn) / 2, btn, btn,
+      tostring(Ops.STACK_MAX), { font = "tiny", enabled = canMax }) then
+    onMax()
+  end
+  if Kit.button(bx + 3 * (btn + 6 * s), y + (h - btn) / 2, btn, btn, "x",
+      { kind = "danger", font = "tiny", radius = 6 * s }) then
+    onDrop()
+  end
+  local qtyText = ("x%d"):format(qty)
+  local qtyW = Kit.textWidth("monoRow", qtyText)
+  Kit.textRight("monoRow", qtyText, bx - 10 * s,
+    y + (h - Kit.textHeight("monoRow")) / 2, PAL.heading)
+  local label = id
+  if Gen.of(S.save) == 2 then
+    label = (Bag.pocketOf(id, S.data) or "ITEM") .. "  " .. id
+  end
+  Kit.text("mono", Kit.ellipsize("mono", label, bx - qtyW - 30 * s - (x + 10 * s)),
+    x + 10 * s, y + (h - Kit.textHeight("mono")) / 2, PAL.text)
+  return clicked
 end
 
--- Prev/Next pagination (mirrors Events/Dex panels) so bag/PC lists longer
--- than VISIBLE_ROWS stay fully reachable instead of truncating silently.
-local function clampScroll(scroll, total)
-  local maxScroll = math.max(0, total - VISIBLE_ROWS)
-  scroll = scroll or 0
-  if scroll > maxScroll then scroll = maxScroll end
-  if scroll < 0 then scroll = 0 end
-  return scroll
+-- ---------------------------------------------------------------- sections
+-- Each card is a function of its own rect so the wide (three column) and the
+-- stacked (#715) layouts are the same drawing code with different geometry.
+
+local function coinsHeight(Kit, s)
+  return 12 * s + math.max(Kit.textHeight("caption"), 26 * s) + 8 * s + 30 * s
 end
 
-local function pageSlice(items, scroll)
-  local page = {}
-  for i = 1, math.min(VISIBLE_ROWS, #items - scroll) do
-    page[i] = items[scroll + i]
-  end
-  return page
+local function moneyHeight(Kit, s, pad, S)
+  return pad * 2 + Kit.textHeight("caption") + 8 * s
+    + Kit.textHeight("headline") + 10 * s + 30 * s + coinsHeight(Kit, s)
 end
 
-local function drawPager(Kit, x, y, total, scroll, onPrev, onNext)
-  if Kit.button(x, y, 90, 26, "Prev") then onPrev() end
-  if Kit.button(x + 100, y, 90, 26, "Next") then onNext() end
-  local shown = math.min(VISIBLE_ROWS, math.max(0, total - scroll))
-  Kit.label(x + 210, y + 5, string.format("%d-%d of %d",
-    total > 0 and scroll + 1 or 0, scroll + shown, total))
-end
-
-local function clamp(n, lo, hi)
-  if n < lo then return lo end
-  if n > hi then return hi end
-  return n
-end
-
-local function isBadgeId(id)
-  return id:find("BADGE", 1, true) ~= nil
-end
-
-local function badgeIds(cat)
-  local ids = {}
-  for _, id in ipairs(cat.items) do
-    if isBadgeId(id) then table.insert(ids, id) end
+local function drawMoney(S, Kit, x, y, w, h)
+  local s = Kit.scale
+  local pad = 16 * s
+  Kit.card(x, y, w, h)
+  Kit.caption(x + pad, y + pad, "MONEY")
+  local maxW = 74 * s
+  if Kit.button(x + w - pad - maxW, y + pad - 4 * s, maxW, 26 * s, "Max out",
+      { kind = "accent", font = "tiny", radius = 7 * s,
+        enabled = Gen.money(S.save) < Ops.MONEY_MAX }) then
+    Ops.maxMoney(S)
   end
-  return ids
-end
-
-local function bagLines(save)
-  local order = Bag.order(save)
-  local lines = {}
-  for i, id in ipairs(order) do
-    lines[i] = string.format("%-16s x%d", id, save.inventory[id] or 0)
-  end
-  return lines, order
-end
-
-local function pcItemOrder(pcItems)
-  local ids = {}
-  for id in pairs(pcItems) do table.insert(ids, id) end
-  table.sort(ids)
-  return ids
-end
-
-local function pcLines(pcItems, order)
-  local lines = {}
-  for i, id in ipairs(order) do
-    lines[i] = string.format("%-16s x%d", id, pcItems[id] or 0)
-  end
-  return lines
-end
-
-local function pcAdd(save, id, qty)
-  save.pcItems = save.pcItems or {}
-  local pc = save.pcItems
-  pc[id] = math.min(99, (pc[id] or 0) + (qty or 1))
-end
-
-local function pcRemove(save, id, qty)
-  local pc = save.pcItems
-  if not pc or not pc[id] then return end
-  pc[id] = pc[id] - (qty or 1)
-  if pc[id] <= 0 then pc[id] = nil end
-end
-
-function M.draw(S, Kit, x, y)
-  S.save.pcItems = S.save.pcItems or {}
-
-  -- Money
-  Kit.label(x, y, "Money: $" .. tostring(S.save.money))
-  local moneyBtnY = y + 22
-  if Kit.button(x, moneyBtnY, 60, 26, "-100") then
-    S.save.money = clamp(S.save.money - 100, 0, 999999); mark(S)
-  end
-  if Kit.button(x + 66, moneyBtnY, 60, 26, "-10") then
-    S.save.money = clamp(S.save.money - 10, 0, 999999); mark(S)
-  end
-  if Kit.button(x + 132, moneyBtnY, 60, 26, "+10") then
-    S.save.money = clamp(S.save.money + 10, 0, 999999); mark(S)
-  end
-  if Kit.button(x + 198, moneyBtnY, 60, 26, "+100") then
-    S.save.money = clamp(S.save.money + 100, 0, 999999); mark(S)
-  end
-
-  -- Item picker (species-like picker over S.cat.items) shared by bag/PC add
-  local pickerY = moneyBtnY + 40
-  S.itemPickerIdx = clamp(S.itemPickerIdx or 1, 1, #S.cat.items)
-  local pickId = S.cat.items[S.itemPickerIdx]
-  Kit.label(x, pickerY + 5, "Item:")
-  if Kit.button(x + 46, pickerY, 26, 26, "<") then
-    S.itemPickerIdx = ((S.itemPickerIdx - 2) % #S.cat.items) + 1
-  end
-  Kit.label(x + 82, pickerY + 5, pickId)
-  if Kit.button(x + 280, pickerY, 26, 26, ">") then
-    S.itemPickerIdx = (S.itemPickerIdx % #S.cat.items) + 1
-  end
-  if Kit.button(x + 320, pickerY, 110, 26, "Add to Bag") then
-    if Bag.add(S.save, pickId, 1) then mark(S) end
-  end
-  if Kit.button(x + 440, pickerY, 110, 26, "Add to PC") then
-    pcAdd(S.save, pickId, 1); mark(S)
-  end
-
-  -- Bag list
-  local bagLabelY = pickerY + 40
-  Kit.label(x, bagLabelY, string.format("Bag (%d/%d slots)", Bag.slots(S.save), Bag.CAPACITY))
-  local bagListY = bagLabelY + 20
-  local lines, order = bagLines(S.save)
-  S.selectedBagIdx = clamp(S.selectedBagIdx or 1, 1, math.max(#order, 1))
-  S.bagScroll = clampScroll(S.bagScroll, #order)
-  local bagClick = Kit.list(x, bagListY, 300, LIST_H, pageSlice(lines, S.bagScroll),
-    S.selectedBagIdx - S.bagScroll, ROW_H)
-  if bagClick then S.selectedBagIdx = S.bagScroll + bagClick end
-
-  local bagPagerY = bagListY + LIST_H + 8
-  drawPager(Kit, x, bagPagerY, #order, S.bagScroll,
-    function() S.bagScroll = clampScroll(S.bagScroll - VISIBLE_ROWS, #order) end,
-    function() S.bagScroll = clampScroll(S.bagScroll + VISIBLE_ROWS, #order) end)
-
-  local bagActionsY = bagPagerY + 34
-  if Kit.button(x, bagActionsY, 100, 28, "Remove 1") then
-    local id = order[S.selectedBagIdx]
-    if id then
-      Bag.remove(S.save, id, 1)
-      S.selectedBagIdx = clamp(S.selectedBagIdx, 1, math.max(#Bag.order(S.save), 1))
-      mark(S)
-    end
-  end
-  if Kit.button(x + 110, bagActionsY, 100, 28, "Remove all") then
-    local id = order[S.selectedBagIdx]
-    if id then
-      Bag.remove(S.save, id, S.save.inventory[id])
-      S.selectedBagIdx = clamp(S.selectedBagIdx, 1, math.max(#Bag.order(S.save), 1))
-      mark(S)
+  Kit.text("headline", ("$%d"):format(Gen.money(S.save)), x + pad,
+    y + pad + Kit.textHeight("caption") + 8 * s, PAL.yellow)
+  local coinsH = coinsHeight(Kit, s)
+  local mbY = y + h - pad - coinsH - 30 * s
+  local mbW = (w - 2 * pad - 3 * 8 * s) / 4
+  for i, delta in ipairs(MONEY_STEPS) do
+    local label = (delta > 0 and "+" or "") .. tostring(delta)
+    if Kit.button(x + pad + (i - 1) * (mbW + 8 * s), mbY, mbW, 30 * s, label,
+        { kind = "accent", font = "tiny", radius = 8 * s }) then
+      Ops.addMoney(S, delta)
     end
   end
 
-  -- PC items list (mirrors bag UX; plain dict, no slot cap)
-  local pcLabelY = bagActionsY + 40
-  local pcOrder = pcItemOrder(S.save.pcItems)
-  Kit.label(x, pcLabelY, string.format("PC Items (%d kinds)", #pcOrder))
-  local pcListY = pcLabelY + 20
-  S.selectedPcIdx = clamp(S.selectedPcIdx or 1, 1, math.max(#pcOrder, 1))
-  S.pcScroll = clampScroll(S.pcScroll, #pcOrder)
-  local pcClick = Kit.list(x, pcListY, 300, LIST_H,
-    pageSlice(pcLines(S.save.pcItems, pcOrder), S.pcScroll),
-    S.selectedPcIdx - S.pcScroll, ROW_H)
-  if pcClick then S.selectedPcIdx = S.pcScroll + pcClick end
-
-  local pcPagerY = pcListY + LIST_H + 8
-  drawPager(Kit, x, pcPagerY, #pcOrder, S.pcScroll,
-    function() S.pcScroll = clampScroll(S.pcScroll - VISIBLE_ROWS, #pcOrder) end,
-    function() S.pcScroll = clampScroll(S.pcScroll + VISIBLE_ROWS, #pcOrder) end)
-
-  local pcActionsY = pcPagerY + 34
-  if Kit.button(x, pcActionsY, 100, 28, "Remove 1") then
-    local id = pcOrder[S.selectedPcIdx]
-    if id then
-      pcRemove(S.save, id, 1)
-      pcOrder = pcItemOrder(S.save.pcItems)
-      S.selectedPcIdx = clamp(S.selectedPcIdx, 1, math.max(#pcOrder, 1))
-      mark(S)
+  -- Game Corner coins, both generations: ram/wram.asm:1908 wPlayerCoins
+  local rowH = math.max(Kit.textHeight("caption"), 26 * s)
+  local cy = mbY + 30 * s + 12 * s
+  Kit.caption(x + pad, cy + (rowH - Kit.textHeight("caption")) / 2, "COINS")
+  local coinMaxW = 52 * s
+  if Kit.button(x + w - pad - coinMaxW, cy, coinMaxW, 26 * s, "Max",
+      { kind = "accent", font = "tiny", radius = 7 * s,
+        enabled = Gen.coins(S.save) < Ops.COIN_MAX }) then
+    Ops.maxCoins(S)
+  end
+  Kit.text("mono", ("%d"):format(Gen.coins(S.save)),
+    x + pad + Kit.captionWidth("COINS") + 12 * s,
+    cy + (rowH - Kit.textHeight("mono")) / 2, PAL.yellow)
+  local cbY = cy + rowH + 8 * s
+  local cbW = (w - 2 * pad - 3 * 8 * s) / 4
+  for i, delta in ipairs(COIN_STEPS) do
+    local label = (delta > 0 and "+" or "") .. tostring(delta)
+    if Kit.button(x + pad + (i - 1) * (cbW + 8 * s), cbY, cbW, 30 * s, label,
+        { kind = "accent", font = "tiny", radius = 8 * s }) then
+      Ops.addCoins(S, delta)
     end
   end
-  if Kit.button(x + 110, pcActionsY, 100, 28, "Remove all") then
-    local id = pcOrder[S.selectedPcIdx]
-    if id then
-      pcRemove(S.save, id, S.save.pcItems[id])
-      pcOrder = pcItemOrder(S.save.pcItems)
-      S.selectedPcIdx = clamp(S.selectedPcIdx, 1, math.max(#pcOrder, 1))
-      mark(S)
+end
+
+-- engine/menus/init_gender.asm:55-56
+local GENDERS = { { "BOY", "male" }, { "GIRL", "female" } }
+
+local function trainerHeight(Kit, s, pad)
+  return pad * 2 + Kit.textHeight("caption") + 10 * s + 28 * s
+end
+
+local function drawTrainer(S, Kit, x, y, w, h)
+  local s = Kit.scale
+  local pad = 16 * s
+  Kit.card(x, y, w, h)
+  Kit.caption(x + pad, y + pad, "TRAINER")
+  Kit.textRight("mono", tostring((S.save.player and S.save.player.name) or "?"),
+    x + w - pad, y + pad, PAL.caption)
+  local cy = y + pad + Kit.textHeight("caption") + 10 * s
+  local chipW = (w - 2 * pad - 8 * s) / 2
+  local gender = Gen.playerGender(S.save)
+  for i, pair in ipairs(GENDERS) do
+    if Kit.chip(x + pad + (i - 1) * (chipW + 8 * s), cy, chipW, 28 * s,
+        pair[1], gender == pair[2], PAL.green, PAL.steel) then
+      Ops.setPlayerGender(S, pair[2])
     end
+  end
+end
+
+local BADGE_COLS = 4
+
+local function badgeHeight(S, Kit, s, pad)
+  local badgeRows = math.ceil(#Ops.badgeIds(S) / BADGE_COLS)
+  return pad * 2 + Kit.textHeight("caption") + 10 * s
+    + badgeRows * (28 * s + 7 * s) - 7 * s
+end
+
+local function drawBadges(S, Kit, x, y, w, h)
+  local s = Kit.scale
+  local pad = 16 * s
+  local badgeIds = Ops.badgeIds(S)
+  Kit.card(x, y, w, h)
+  local earned = 0
+  for _, id in ipairs(badgeIds) do
+    if Gen.hasBadge(S.save, id) then earned = earned + 1 end
+  end
+  Kit.caption(x + pad, y + pad, "BADGES")
+  Kit.textRight("mono", ("%d/%d"):format(earned, #badgeIds), x + w - pad,
+    y + pad, PAL.caption)
+  local bTop = y + pad + Kit.textHeight("caption") + 10 * s
+  local bW = (w - 2 * pad - (BADGE_COLS - 1) * 7 * s) / BADGE_COLS
+  for i, id in ipairs(badgeIds) do
+    local bc = (i - 1) % BADGE_COLS
+    local br = math.floor((i - 1) / BADGE_COLS)
+    local on = Gen.hasBadge(S.save, id)
+    local short = id:gsub("BADGE$", "")
+    if Kit.chip(x + pad + bc * (bW + 7 * s), bTop + br * (28 * s + 7 * s),
+        bW, 28 * s, Kit.ellipsize("micro", short, bW - 8 * s), on,
+        PAL.green, PAL.steel) then
+      Ops.toggleBadge(S, id)
+    end
+  end
+end
+
+-- The "add an item" card.  It used to hold the whole catalog inline: a search
+-- field plus a scrolling list, sharing this tab's height with the bag and PC
+-- lists beside it, which on a phone left about three catalog rows visible.
+-- Adding a Pokemon was already a full-screen modal; adding an item now opens
+-- the same kind (panels/ItemPicker.lua), so this card is just the door.
+local function drawPicker(S, Kit, x, y, w, h)
+  local s = Kit.scale
+  local pad = 16 * s
+  Kit.card(x, y, w, h)
+  Kit.caption(x + pad, y + pad, "ADD ITEM")
+  local cy = y + pad + Kit.textHeight("caption") + 10 * s
+  local inner = w - 2 * pad
+
+  Kit.text("mono", Kit.ellipsize("mono",
+    "Search the full item list and add to the bag or the PC.", inner),
+    x + pad, cy, PAL.muted)
+  cy = cy + Kit.textHeight("mono") + 12 * s
+
+  local btnH = math.max(34 * s, 34)
+  local half = (inner - 8 * s) / 2
+  if Kit.button(x + pad, cy, half, btnH, "+ Add to bag",
+      { font = "small", kind = "primary" }) then
+    Ops.openItemPicker(S, Kit, "bag")
+  end
+  if Kit.button(x + pad + half + 8 * s, cy, half, btnH, "+ Add to PC",
+      { font = "small", kind = "accent" }) then
+    Ops.openItemPicker(S, Kit, "pc")
+  end
+end
+
+local SORT_MODES = { { "#", "index" }, { "A-Z", "name" } }
+
+local function drawQuantityCard(S, Kit, x, y, w, h, cfg)
+  local s = Kit.scale
+  local pad = 16 * s
+  Kit.card(x, y, w, h)
+  Kit.caption(x + pad, y + pad, cfg.title)
+  local hx = x + w - pad
+  local hy = y + pad - 4 * s
+  local maxW = Kit.textWidth("tiny", "Max all") + 22 * s
+  hx = hx - maxW
+  if Kit.button(hx, hy, maxW, 24 * s, "Max all",
+      { kind = "accent", font = "tiny", radius = 7 * s,
+        enabled = cfg.canMaxAll() }) then
+    cfg.maxAll()
+  end
+  for i = #SORT_MODES, 1, -1 do
+    local mode = SORT_MODES[i]
+    local bw = Kit.textWidth("tiny", mode[1]) + 22 * s
+    hx = hx - 6 * s - bw
+    if Kit.button(hx, hy, bw, 24 * s, mode[1],
+        { kind = "ghost", font = "tiny", radius = 6 * s }) then
+      cfg.sort(mode[2])
+    end
+  end
+  local counterX = hx - 8 * s
+  if counterX - Kit.textWidth("mono", cfg.counter)
+      >= x + pad + Kit.captionWidth(cfg.title) + 8 * s then
+    Kit.textRight("mono", cfg.counter, counterX, y + pad, PAL.caption)
+  end
+  local rowsTop = y + pad + Kit.textHeight("caption") + 8 * s
+  if cfg.meterFrac then
+    Kit.meter(x + pad, rowsTop, w - 2 * pad, 5 * s, cfg.meterFrac * 100,
+      cfg.meterFrac >= 1 and PAL.yellow or PAL.blue)
+    rowsTop = rowsTop + 5 * s + 12 * s
+  else
+    rowsTop = rowsTop + 12 * s
   end
 
-  -- Badges: boolean flags directly on inventory, toggled by click
-  local badgeLabelY = pcActionsY + 40
-  Kit.label(x, badgeLabelY, "Badges (click to toggle)")
-  local badgeY = badgeLabelY + 20
-  local ids = badgeIds(S.cat)
-  for i, id in ipairs(ids) do
-    local col = (i - 1) % 4
-    local row = math.floor((i - 1) / 4)
-    local bx = x + col * 150
-    local by = badgeY + row * 30
-    local on = S.save.inventory[id] == true
-    if Kit.button(bx, by, 144, 26, id .. (on and " [X]" or "")) then
-      if on then S.save.inventory[id] = nil else S.save.inventory[id] = true end
-      mark(S)
+  local pagerH = 30 * s
+  local pagerY = y + h - pad - pagerH
+  local rowH = 36 * s
+  local rowGap = 6 * s
+  local listH = pagerY - 12 * s - rowsTop
+  local perPage = math.max(1, math.floor(listH / (rowH + rowGap)))
+  local order = cfg.order
+  local offset = Ops.clamp(cfg.offset or 0, 0, math.max(0, #order - perPage))
+  -- the wheel moves the same offset the pager below does (#595)
+  offset = Kit.scroll(x + pad, rowsTop, w - 2 * pad, listH, offset, #order, perPage)
+
+  if #order == 0 then
+    Kit.emptyBox(x + pad, rowsTop, w - 2 * pad, math.min(listH, 70 * s), cfg.empty)
+  end
+  Kit.pushClip(x + pad, rowsTop, w - 2 * pad, listH)
+  for i = 1, math.min(perPage, #order - offset) do
+    local id = order[offset + i]
+    local ry = rowsTop + (i - 1) * (rowH + rowGap)
+    if quantityRow(S, Kit, x + pad, ry, w - 2 * pad, rowH, id,
+        cfg.qty(id), id == cfg.selected(),
+        function() cfg.adjust(id, -1) end,
+        function() cfg.adjust(id, 1) end,
+        function() cfg.max(id) end, cfg.canMax(id),
+        function() cfg.drop(id) end) then
+      cfg.select(id)
     end
   end
+  Kit.popClip()
+  Kit.scrollbar(x + pad, rowsTop, w - 2 * pad, listH, offset, #order, perPage)
+  return Kit.pager(x + pad, pagerY, w - 2 * pad, offset, #order, perPage)
+end
+
+local function drawBag(S, Kit, x, y, w, h)
+  local order = Bag.order(S.save)
+  local capacity = Bag.capacity(S.data)
+  S.bagOffset = drawQuantityCard(S, Kit, x, y, w, h, {
+    title = "BAG",
+    counter = ("%d/%d slots"):format(Bag.slots(S.save), capacity),
+    meterFrac = Bag.slots(S.save) / capacity,
+    order = order,
+    offset = S.bagOffset,
+    empty = "Bag is empty.",
+    qty = function(id) return S.save.inventory[id] or 0 end,
+    selected = function() return S.selectedBagId end,
+    select = function(id)
+      S.selectedBagId = id
+      Ops.say(S, ("Selected %s in the bag"):format(id))
+    end,
+    adjust = function(id, d) Ops.bagAdjust(S, id, d) end,
+    max = function(id) Ops.bagMax(S, id) end,
+    canMax = function(id) return Ops.bagCanMax(S, id) end,
+    maxAll = function() Ops.bagMaxAll(S) end,
+    canMaxAll = function() return Ops.bagCanMax(S) end,
+    sort = function(mode) Ops.bagSort(S, mode) end,
+    drop = function(id) Ops.bagDrop(S, id) end,
+  })
+end
+
+local function drawPc(S, Kit, x, y, w, h)
+  local pcOrder = Ops.pcOrder(S)
+  S.pcOffset = drawQuantityCard(S, Kit, x, y, w, h, {
+    title = "PC STORAGE",
+    counter = ("%d kinds"):format(#pcOrder),
+    order = pcOrder,
+    offset = S.pcOffset,
+    empty = "PC storage is empty. Items sent here have no slot cap.",
+    qty = function(id) return S.save.pcItems[id] or 0 end,
+    selected = function() return S.selectedPcId end,
+    select = function(id)
+      S.selectedPcId = id
+      Ops.say(S, ("Selected %s in PC storage"):format(id))
+    end,
+    adjust = function(id, d) Ops.pcAdjust(S, id, d) end,
+    max = function(id) Ops.pcMax(S, id) end,
+    canMax = function(id) return Ops.pcCanMax(S, id) end,
+    maxAll = function() Ops.pcMaxAll(S) end,
+    canMaxAll = function() return Ops.pcCanMax(S) end,
+    sort = function(mode) Ops.pcSort(S, mode) end,
+    drop = function(id) Ops.pcDrop(S, id) end,
+  })
+end
+
+function M.draw(S, Kit, x, y, w, h)
+  local s = Kit.scale
+  local gap = 20 * s
+  local pad = 16 * s
+  Ops.pcItems(S)
+
+  local moneyH = moneyHeight(Kit, s, pad, S)
+  local badgeH = badgeHeight(S, Kit, s, pad)
+  local topH = 0
+  if Gen.hasPlayerGender(S.save, S.version) then
+    topH = trainerHeight(Kit, s, pad) + gap
+  end
+  if w < 900 * s or h - topH - moneyH - badgeH - 2 * gap < 150 * s then
+    -- stacked (#715): one full-width column, scrolled in pixels.  The offset
+    -- from LAST frame's scrollPixels call positions this frame, and the call
+    -- itself comes after the cards so their inner lists claim the wheel or a
+    -- drag over their own bodies first.
+    local off = Theme.clamp(S.itemsScroll or 0, 0,
+      math.max(0, (S._itemsContentH or 0) - h))
+    local pickH = 280 * s
+    local listH = 300 * s
+    Kit.pushClip(x, y, w, h)
+    local cy = y - off
+    if Gen.hasPlayerGender(S.save, S.version) then
+      local trainerH = trainerHeight(Kit, s, pad)
+      drawTrainer(S, Kit, x, cy, w, trainerH); cy = cy + trainerH + gap
+    end
+    drawMoney(S, Kit, x, cy, w, moneyH);      cy = cy + moneyH + gap
+    drawPicker(S, Kit, x, cy, w, pickH);      cy = cy + pickH + gap
+    drawBadges(S, Kit, x, cy, w, badgeH);     cy = cy + badgeH + gap
+    drawBag(S, Kit, x, cy, w, listH);         cy = cy + listH + gap
+    drawPc(S, Kit, x, cy, w, listH);          cy = cy + listH
+    Kit.popClip()
+    S._itemsContentH = (cy + off) - y
+    S.itemsScroll = Kit.scrollPixels(x, y, w, h, off, S._itemsContentH)
+    return
+  end
+
+  local leftW = math.max(260 * s, math.min(320 * s, w * 0.26))
+  local listW = (w - leftW - 2 * gap) / 2
+  local bagX = x + leftW + gap
+  local pcX = bagX + listW + gap
+
+  -- Money and badges are fixed-height so the picker gets every pixel left
+  -- over: cycling through ~250 item ids in a two-row list was the thing that
+  -- made the old panel unusable.
+  if topH > 0 then
+    drawTrainer(S, Kit, x, y, leftW, topH - gap)
+  end
+  drawMoney(S, Kit, x, y + topH, leftW, moneyH)
+  drawPicker(S, Kit, x, y + topH + moneyH + gap, leftW,
+    h - topH - moneyH - badgeH - 2 * gap)
+  drawBadges(S, Kit, x, y + h - badgeH, leftW, badgeH)
+  drawBag(S, Kit, bagX, y, listW, h)
+  drawPc(S, Kit, pcX, y, listW, h)
 end
 
 return M

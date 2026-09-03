@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
-	<string>Pokemon Red</string>
+	<string>gen1recomp++</string>
 	<key>CFBundleDocumentTypes</key>
 	<array>
 		<dict>
@@ -32,27 +32,34 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>${PRODUCT_NAME}</string>
+	<string>gen1recomp++</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>gen1recomp++ launch options</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>gen1recomp++</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleShortVersionString</key>
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleSignature</key>
 	<string>????</string>
 	<key>CFBundleVersion</key>
-	<string>1.0</string>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
-	<false/>
+	<true/>
 	<key>UIFileSharingEnabled</key>
-	<false/>
+	<true/>
 	<key>UILaunchStoryboardName</key>
 	<string>Launch Screen</string>
-	<key>UIRequiredDeviceCapabilities</key>
-	<array>
-		<string>opengles-2</string>
-	</array>
 	<key>UIStatusBarHidden</key>
 	<true/>
 	<key>UIViewControllerBasedStatusBarAppearance</key>
@@ -100,5 +107,9 @@
 			</dict>
 		</dict>
 	</array>
+	<!-- gen1recomp iOS: Pokéwalker mod reads step counts (opt-in, in the
+	     in-game mod manager) and converts them to Pokémon EXP. -->
+	<key>NSHealthShareUsageDescription</key>
+	<string>The Pokéwalker mod reads your step count to give your Pokémon party experience points for real-world walking.</string>
 </dict>
 </plist>

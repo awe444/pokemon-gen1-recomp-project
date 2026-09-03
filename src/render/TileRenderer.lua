@@ -11,9 +11,9 @@ TileRenderer.__index = TileRenderer
 local BORDER_BLOCKS = 3 -- ring width; > half a screen (2.5 blocks)
 
 -- OVERWORLD maps fill beyond-edge space from save.options.voidFill:
---   trees (default) — solid tree wall $0F (Viridian/Cerulean/Celadon)
---   water           — solid water $43 (Cinnabar/Route 19 border block)
---   black           — solid black (no tiled metatile)
+--   trees (default) -- solid tree wall $0F (Viridian/Cerulean/Celadon)
+--   water           -- solid water $43 (Cinnabar/Route 19 border block)
+--   black           -- solid black (no tiled metatile)
 -- Other tilesets keep their designated border (interiors stay black/void).
 local TREE_WALL_BLOCK = 0x0F
 local WATER_BORDER_BLOCK = 0x43
@@ -94,7 +94,7 @@ local SPINNER_STRIP = "assets/generated/tilesets/spinners.png"
 
 local animFrame = 0
 local animAccum = 0
-local ANIM_STEP = 1 / 60 -- Game Boy logic rate (matches FixedStep.STEP)
+local FixedStep = require("src.core.FixedStep")
 
 -- Advance water/flower/spinner tile animation.  Called from the overworld
 -- draw path so it keeps running under dialogs (overworld update does not),
@@ -111,9 +111,10 @@ function TileRenderer.tick(dt)
     return
   end
   -- Cap catch-up so a long stall cannot jump many water/flower periods
+  local step = FixedStep.STEP
   animAccum = math.min(animAccum + dt, 0.25)
-  while animAccum >= ANIM_STEP do
-    animAccum = animAccum - ANIM_STEP
+  while animAccum >= step do
+    animAccum = animAccum - step
     animFrame = animFrame + 1
   end
 end
@@ -150,13 +151,10 @@ end
 
 -- true while the spinner arrow tiles should show the 'blur' graphic; false
 -- means draw nothing extra (the static window tile shows through,
--- matching the asm's restore-to-original behavior). The 8-tick
--- half-period approximates one GB movement step (2px/frame); this is a
--- deliberate approximation of wSimulatedJoypadStatesIndex bit-0 parity, not
--- a cycle-accurate replication -- the port's tweened scriptMove has no
--- direct equivalent discrete step counter.
+-- matching the asm's restore-to-original behavior).
+-- spinners.asm:17-22, home/overworld.asm:1844-1846, :49-52
 function TileRenderer.spinBlurActive()
-  return spinning and (math.floor(animFrame / 8) % 2 == 0)
+  return spinning and (math.floor(animFrame / 16) % 2 == 0)
 end
 
 -- ------------------------------------------------------------------
@@ -402,8 +400,15 @@ end
 -- the route's own default roof (Vermilion's) throughout.
 local gbcAtlasCache = {}
 
+-- Cache suffix for a map's RED++ bake.  A dark cave folds FadePal2 into the
+-- palette worldGroupColors hands the bake (#383), so the lit and dark bakes of
+-- one map are different images and must not share a key.
+local function gbcKeyFor(mapId)
+  return "#gbc:" .. mapId .. PaletteFX.darkKey()
+end
+
 local function getGbcAtlas(imagePath, tilesetId, mapId, perRow, data)
-  local key = imagePath .. "#gbc:" .. mapId
+  local key = imagePath .. gbcKeyFor(mapId)
   if gbcAtlasCache[key] ~= nil then return gbcAtlasCache[key] or nil end
   local img = false
   if love.image and love.image.newImageData then
@@ -473,8 +478,16 @@ function TileRenderer.new(map, data)
       self.gbcAtlas = true
       -- also recolors the animated water/flower entries below, so they
       -- match the atlas's static tiles instead of showing raw grayscale
-      gbcCtx = { tilesetId = map.tileset.id, mapId = map.id, key = "#gbc:" .. map.id,
+      gbcCtx = { tilesetId = map.tileset.id, mapId = map.id, key = gbcKeyFor(map.id),
                 groupColors = PaletteFX.worldGroupColors(data, map.tileset.id, map.id, nil) }
+      -- ...and feeds the color-0-keyed single tiles the feet overdraw needs
+      -- (see getKeyedTile): same source image and palette groups, so keep the
+      -- context rather than re-deriving it per draw.
+      gbcCtx.imagePath = map.tileset.image
+      gbcCtx.perRow = map.tileset.tilesPerRow
+      self.gbcCtx = gbcCtx
+      self.gbcAtlasKey = map.tileset.image .. gbcCtx.key
+      self.gbcKeyed = {}
     end
   end
   -- a full-color atlas colors everything it paints, ring and border fill
@@ -575,7 +588,7 @@ local function ensureWaterBorderFill(self)
     local groupColors = PaletteFX.worldGroupColors(
       self.data, map.tileset.id, map.id, nil)
     colors = group and groupColors and groupColors[group + 1] or nil
-    gbcKey = "#gbc:" .. map.id
+    gbcKey = gbcKeyFor(map.id)
   end
   local textures = getShiftVariants(map.tileset.image, perRow, WATER_TILE,
                                     colors, gbcKey)
@@ -672,17 +685,48 @@ local function getColor0KeyShader()
   return color0KeyShader or nil
 end
 
--- draw a cell's bottom tile row without touching the shader (the caller
--- owns it).  drawCellBottom wraps this with the color-0 key; tilt mode's
--- upright pass wraps it with a color-0-keyed palette shader instead
--- (PaletteFX.keyedShader) so the feet patch is colorized like the ground.
+-- RED++ (COLORS=ADVANCED): the color-0 key, BAKED instead of tested for.
+local function getKeyedTile(self, tile)
+  local ctx = self.gbcCtx
+  local cached = self.gbcKeyed[tile]
+  if cached ~= nil then return cached or nil end
+  local img = false
+  if ctx.groupColors and love.image and love.image.newImageData then
+    local group = PaletteFX.worldGroupAt(ctx.tilesetId, ctx.mapId, tile)
+    local colors = group and ctx.groupColors[group + 1]
+    local src = Assets.imageData(ctx.imagePath)
+    local ox = (tile % ctx.perRow) * 8
+    local oy = math.floor(tile / ctx.perRow) * 8
+    local out = love.image.newImageData(8, 8)
+    for py = 0, 7 do
+      for px = 0, 7 do
+        local r, g, b, a = src:getPixel(ox + px, oy + py)
+        -- read shade 0 off the RAW sheet, on recolorSample's own cutoff, so
+        -- the keyed pixels are exactly the ones the shader path keys
+        local shade0 = r > 0.83
+        r, g, b, a = recolorSample(r, g, b, a, colors)
+        out:setPixel(px, py, r, g, b, shade0 and 0 or a)
+      end
+    end
+    img = love.graphics.newImage(out)
+  end
+  self.gbcKeyed[tile] = img
+  return img or nil
+end
+
 function TileRenderer:drawCellBottomRaw(cx, cy, camX, camY)
   local ty = cy * 2 + 1
   for i = 0, 1 do
     local tx = cx * 2 + i
-    local quad = self.quads[self.map:tileAt(tx, ty)]
-    if quad then
-      love.graphics.draw(self.image, quad, tx * 8 - camX, ty * 8 - camY)
+    local tile = self.map:tileAt(tx, ty)
+    local keyed = tile and self.gbcCtx and getKeyedTile(self, tile)
+    if keyed then
+      love.graphics.draw(keyed, tx * 8 - camX, ty * 8 - camY)
+    else
+      local quad = self.quads[tile]
+      if quad then
+        love.graphics.draw(self.image, quad, tx * 8 - camX, ty * 8 - camY)
+      end
     end
   end
 end
@@ -690,7 +734,9 @@ end
 -- redraw a cell's bottom tile row (tall grass hides the lower half of
 -- sprites standing in it, like the GB sprite-priority trick)
 function TileRenderer:drawCellBottom(cx, cy, camX, camY)
-  local shader = getColor0KeyShader()
+  -- the RED++ path is pre-keyed; the white test would be a no-op there at
+  -- best, and a false hit on some other group's near-white color 0 at worst
+  local shader = not self.gbcCtx and getColor0KeyShader() or nil
   if shader then love.graphics.setShader(shader) end
   self:drawCellBottomRaw(cx, cy, camX, camY)
   if shader then love.graphics.setShader() end
@@ -712,13 +758,8 @@ function TileRenderer:markCellBottomRedraw(cx, cy, camX, camY, colors)
   end
 end
 
--- Window cover for the static tile layer.  Refill the reusable window batch
--- (and the per-entry animated batches) only when the camera has scrolled past
--- what they already cover; a small margin keeps small scrolls free.  Cost
--- scales with the view, never the map -- crossing a seam or warping in builds
--- nothing.  The beyond-body area (what the old 3-block ring drew) is painted
--- by :drawBorderFill, whose world-aligned border-block tiling is identical
--- there, so only body tiles are gathered here.
+
+
 local WINDOW_MARGIN = 8 -- tiles of slack kept around the view between refills
 
 function TileRenderer:ensureWindow(camX, camY, vw, vh)
@@ -873,9 +914,16 @@ end
 -- atlas -- is unique to this map (gbcAtlasCache is keyed by map id).
 function TileRenderer:release()
   self:releaseBatches()
+  if self.gbcKeyed then
+    -- baked per instance, shared with nobody (see getKeyedTile)
+    for _, img in pairs(self.gbcKeyed) do safeRelease(img) end
+    self.gbcKeyed = nil
+    self.gbcCtx = nil
+  end
   if self.gbcAtlas and self.image then
-    local key = self.map.tileset.image .. "#gbc:" .. self.map.id
+    local key = self.gbcAtlasKey or (self.map.tileset.image .. gbcKeyFor(self.map.id))
     if gbcAtlasCache[key] == self.image then gbcAtlasCache[key] = nil end
+    self.gbcAtlasKey = nil
     safeRelease(self.image)
     self.image = nil
     self.gbcAtlas = nil
@@ -901,6 +949,13 @@ function TileRenderer.invalidate()
   frameImages = {}
   toggleImages = {}
   stripData = {}
+  -- RED++ per-map atlases are large Images; clear and release so an
+  -- in-process Play → launcher → Play loop does not keep every prior
+  -- session's bake in VRAM / Lua heap.
+  for key, img in pairs(gbcAtlasCache) do
+    safeRelease(img)
+    gbcAtlasCache[key] = nil
+  end
 end
 
 Assets.register(TileRenderer.invalidate)

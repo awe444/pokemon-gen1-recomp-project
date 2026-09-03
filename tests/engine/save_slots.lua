@@ -69,6 +69,21 @@ do
   local n2, m2 = SaveData.slotSummary(nil)
   T.eq(n2, nil, "slotSummary of an empty slot has no name")
   T.eq(m2, nil, "slotSummary of an empty slot has no meta")
+
+  -- A Gen 2 (Gold) save stores playTime as a { hours, minutes, seconds,
+  -- frames } table, not a seconds count.  The launcher lists EVERY version's
+  -- slots, so a math.floor on that table crashed the whole launcher the moment
+  -- a Gold save existed -- and dropped its CONTINUE row.  slotSummary reads
+  -- both shapes now.
+  local gName, gMeta = SaveData.slotSummary({
+    player = { name = "GOLD" },
+    playTime = { hours = 3, minutes = 35, seconds = 40, frames = 45 },
+    pokedex = { owned = { CYNDAQUIL = true, PIDGEY = true } },
+  })
+  T.eq(gName, "GOLD", "slotSummary reads a Gen 2 save's name")
+  T.eq(gMeta.dexCount, 2, "and its dex count")
+  T.eq(gMeta.timeText, "3:35",
+    "and formats the Gen 2 { hours, minutes, seconds } playTime without crashing")
 end
 
 -- ---------------------------------------------- legacy migration happy path
@@ -217,6 +232,50 @@ do
 
   local loaded = SaveData.load("red")
   T.check(loaded and loaded.player.name == "SLOT2", "load reads back from slot2")
+end
+
+-- ---------------------------------------------- renameSlot (#205)
+
+do
+  local files = fresh()
+  local a = SaveData.createSlot("red")
+  local b = SaveData.createSlot("red")
+  local save = SaveData.newGame()
+  save.player.name = "ASH"
+  T.check(SaveData.writeSlot("red", a, save), "seed slot1 with a save")
+
+  T.check(SaveData.renameSlot("red", a, "Nuzlocke"),
+    "renameSlot labels a registered slot")
+  local opts = SaveSerializer.decode(files["options.lua"])
+  T.eq(opts.saveSlots.red.names[a], "Nuzlocke",
+    "the label persists in the options registry")
+
+  local slots = SaveData.listSlots("red")
+  T.eq(slots[1].label, "Nuzlocke", "listSlots carries the custom label")
+  T.eq(slots[1].name, "ASH", "the player name still comes through separately")
+  T.eq(slots[2].label, nil, "an unlabeled slot has no label")
+
+  T.check(SaveData.renameSlot("red", b, "  "), "whitespace-only clears")
+  T.check(SaveData.renameSlot("red", a, ""),
+    "an empty name clears the label")
+  opts = SaveSerializer.decode(files["options.lua"])
+  T.eq(opts.saveSlots.red.names and opts.saveSlots.red.names[a], nil,
+    "cleared labels leave the registry")
+  T.eq(SaveData.listSlots("red")[1].label, nil, "the row is unlabeled again")
+
+  -- trimming + delete cleanup
+  T.check(SaveData.renameSlot("red", a, "  Victory run  "),
+    "renameSlot trims the label")
+  T.eq(SaveData.listSlots("red")[1].label, "Victory run",
+    "the stored label is trimmed")
+  T.check(SaveData.deleteSlot("red", a), "delete the labeled slot")
+  opts = SaveSerializer.decode(files["options.lua"])
+  T.eq(opts.saveSlots.red.names[a], nil, "deleteSlot drops the label too")
+
+  local bad, badErr = SaveData.renameSlot("red", "slot99", "x")
+  T.check(not bad, "renaming an unknown slot fails")
+  T.check(tostring(badErr):find("not registered", 1, true) ~= nil,
+    "unknown-slot rename error is user-presentable")
 end
 
 -- ---------------------------------------------- a version with no slots

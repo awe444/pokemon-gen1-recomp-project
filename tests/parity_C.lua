@@ -26,11 +26,9 @@ local Sound = require("src.core.Sound")
 local Map = require("src.world.Map")
 local Warp = require("src.world.Warp")
 
--- synchronous scriptMove/takeWarp for the walk-out: elevatorWalkOut
--- (data/scripts/story3.lua) rewrites the car's exit warps then walks the
--- player out through the doorway and takes the rewritten warp, instead of
--- the old jump-cut startWarpTo.
-local DIRVEC = { up = { 0, -1 }, down = { 0, 1 }, left = { -1, 0 }, right = { 1, 0 } }
+-- synchronous takeWarp: after the ride the car's exit warps are rewritten
+-- and the player walks out onto one under their own control, so the test
+-- takes that warp itself instead of expecting a scripted walk-out.
 
 -- the Rocket Hideout keyGate path pushes a TextBox, which needs the font
 -- loaded (like tests/run_tests.lua does before any TextBox use)
@@ -71,10 +69,19 @@ local function restoreWarps(mapId, snap)
   end
 end
 
--- drives one elevator map's onEnter and returns the pushed state (either a
--- ListMenu or, for the keyGated Rocket Hideout without the key, a TextBox).
--- fromMapId is the floor the player entered from (OverworldState:setMap
--- passes it), used to seed a cancel-safe walk-out destination.
+-- the car's panel bg_event (data/maps/objects/CeladonMartElevator.asm
+-- etc.): the TEXT_ constant whose talk script opens the floor menu
+local PANEL_TEXT = {
+  SILPH_CO_ELEVATOR = "TEXT_SILPHCOELEVATOR_ELEVATOR",
+  CELADON_MART_ELEVATOR = "TEXT_CELADONMARTELEVATOR",
+  ROCKET_HIDEOUT_ELEVATOR = "TEXT_ROCKETHIDEOUTELEVATOR",
+}
+
+-- drives one elevator map's onEnter and then its panel talk script, and
+-- returns the pushed state (either a ListMenu or, for the keyGated Rocket
+-- Hideout without the key, a TextBox).  fromMapId is the floor the player
+-- entered from (OverworldState:setMap passes it), used to seed a
+-- cancel-safe exit.
 local function openElevator(mapId, inventory, fromMapId)
   local script = mapScripts.get(mapId)
   check(script ~= nil, mapId .. " script registered")
@@ -84,25 +91,13 @@ local function openElevator(mapId, inventory, fromMapId)
   local ow = {}
   -- the real elevator car map (built without the tile renderer -- Map.new
   -- is pure data), plus the player standing on the exit tile they warped
-  -- in onto (the true arrival cell), so the post-ride walk-out has a
-  -- door and geometry to work with
+  -- in onto (the true arrival cell)
   local carDef = Data.maps[mapId]
   ow.map = Map.new(carDef, Data.tilesets[carDef.tileset])
   local firstWarp = carDef.warps[1]
   ow.player = { cellX = firstWarp.x, cellY = firstWarp.y, facing = "up" }
-  ow.scriptMoves = {}
-  ow.walkSteps = {}
   function ow:startWarpTo(map, x, y, facing)
     warpCalls[#warpCalls + 1] = { map = map, x = x, y = y, facing = facing }
-  end
-  -- synchronous: advance the entity one step per tile and fire onDone
-  function ow:scriptMove(entity, dir, tiles, onDone)
-    local d = DIRVEC[dir]
-    entity.cellX = entity.cellX + d[1] * tiles
-    entity.cellY = entity.cellY + d[2] * tiles
-    entity.facing = dir
-    self.walkSteps[#self.walkSteps + 1] = dir
-    if onDone then onDone() end
   end
   -- resolve the (rewritten) warp entry like OverworldState:takeWarp does
   function ow:takeWarp(warpDef)
@@ -117,7 +112,29 @@ local function openElevator(mapId, inventory, fromMapId)
   }
   sfxCalls = {}
   script.onEnter(game, ow, fromMapId)
+  -- #395: entry only seeds the car's exit warps; the floor menu belongs
+  -- to the panel bg_event, so nothing may be pushed yet
+  eq(#items, 0, mapId .. " onEnter opens no menu")
+  local panel = script.talk and script.talk[PANEL_TEXT[mapId]]
+  check(panel ~= nil, mapId .. " panel bg_event has a talk script")
+  if panel then panel(game, ow, nil, function() end) end
+  -- opens from its onShown (engine/events/elevator.asm:2-3)
+  local prompt = items[#items]
+  if prompt and prompt.stay and prompt.stay.onShown then
+    check(prompt.isTextBox, mapId .. " prints the prompt in a text box first")
+    prompt.stay.onShown()
+  end
   return items[#items], warpCalls, stack, ow
+end
+
+-- the $ff terminator's CANCEL row (home/list_menu.asm:371-372, 523-528)
+local function checkCancelRow(menu, floors, label)
+  eq(#menu.items, floors + 1, label .. " lists all " .. floors ..
+     " floors plus the terminator")
+  local last = menu.items[#menu.items]
+  eq(last and last.cancel, true, label .. " ends on the terminator row")
+  eq(last and last.label, require("src.core.Strings")("CANCEL"),
+     label .. " prints that row as CANCEL")
 end
 
 -- step the ElevatorShake state (pokered ShakeElevator) frame by frame
@@ -158,7 +175,7 @@ do
     openElevator("SILPH_CO_ELEVATOR", nil, "SILPH_CO_5F")
   check(menu ~= nil and getmetatable(menu) == ListMenu, "SILPH_CO_ELEVATOR opens a ListMenu")
   if menu then
-    eq(#menu.items, 11, "Silph Co elevator lists all 11 floors")
+    checkCancelRow(menu, 11, "Silph Co elevator")
     local wantOrder = { "1F", "2F", "3F", "4F", "5F", "6F", "7F", "8F", "9F", "10F", "11F" }
     for i, want in ipairs(wantOrder) do
       local item = menu.items[i]
@@ -202,7 +219,6 @@ do
     -- cycle, then SFX_SAFARI_ZONE_PA, and only then the floor warp.
     clear(warpCalls)
     sfxCalls = {}
-    ow.walkSteps = {}
     local chosen = menu.items[5] -- "5F"
     menu.onChoose(chosen, menu)
     eq(#warpCalls, 0, "choosing a floor does not warp on the spot (the shake runs first)")
@@ -222,8 +238,9 @@ do
     -- floor, then the player walks out onto that warp (no jump cut)
     eq(ow.map.def.warps[1].destMap, chosen.value.map,
        "the car's exit warp is rewritten to the chosen floor's map")
-    check(#ow.walkSteps >= 1, "the player walks out of the car (scriptMove, not a jump-cut)")
-    eq(#warpCalls, 1, "the rewritten warp fires exactly once, after the walk-out")
+    eq(#warpCalls, 0, "the ride never warps: the player walks out of the car themselves")
+    ow:takeWarp(ow.map.def.warps[1])
+    eq(#warpCalls, 1, "walking out takes the rewritten warp")
     if warpCalls[1] then
       eq(warpCalls[1].map, chosen.value.map, "walk-out lands on the chosen floor's map")
       eq(warpCalls[1].x, chosen.value.x, "walk-out lands on the chosen floor's x")
@@ -241,7 +258,7 @@ do
   local menu, warpCalls, stack, ow = openElevator("CELADON_MART_ELEVATOR")
   check(menu ~= nil and getmetatable(menu) == ListMenu, "CELADON_MART_ELEVATOR opens a ListMenu")
   if menu then
-    eq(#menu.items, 5, "Celadon Mart elevator lists all 5 floors")
+    checkCancelRow(menu, 5, "Celadon Mart elevator")
     local wantOrder = { "1F", "2F", "3F", "4F", "5F" }
     for i, want in ipairs(wantOrder) do
       eq(menu.items[i] and menu.items[i].label, want, "Celadon Mart floor " .. i .. " label/order")
@@ -266,8 +283,9 @@ do
     eq(sfxCalls[#sfxCalls], "Safari_Zone_PA", "Celadon Mart ride ends on the PA chime")
     eq(ow.map.def.warps[1].destMap, chosen.value.map,
        "Celadon Mart car exit warp rewritten to the chosen floor")
-    check(#ow.walkSteps >= 1, "Celadon Mart player walks out (scriptMove, not a jump-cut)")
-    eq(#warpCalls, 1, "Celadon Mart rewritten warp fires once, after the walk-out")
+    eq(#warpCalls, 0, "Celadon Mart ride never warps on its own")
+    ow:takeWarp(ow.map.def.warps[1])
+    eq(#warpCalls, 1, "Celadon Mart walking out takes the rewritten warp")
     if warpCalls[1] then
       eq(warpCalls[1].map, chosen.value.map, "Celadon Mart walk-out lands on the chosen floor map")
       eq(warpCalls[1].x, chosen.value.x, "Celadon Mart walk-out lands on the chosen floor x")
@@ -302,7 +320,7 @@ do
   check(menu ~= nil and getmetatable(menu) == ListMenu,
         "Rocket Hideout with LIFT_KEY opens a ListMenu")
   if menu then
-    eq(#menu.items, 3, "Rocket Hideout elevator lists all 3 floors")
+    checkCancelRow(menu, 3, "Rocket Hideout elevator")
     local wantOrder = { "B1F", "B2F", "B4F" }
     for i, want in ipairs(wantOrder) do
       eq(menu.items[i] and menu.items[i].label, want, "Rocket Hideout floor " .. i .. " label/order")
@@ -326,8 +344,9 @@ do
     eq(sfxCalls[#sfxCalls], "Safari_Zone_PA", "Rocket Hideout ride ends on the PA chime")
     eq(ow.map.def.warps[1].destMap, chosen.value.map,
        "Rocket Hideout car exit warp rewritten to the chosen floor")
-    check(#ow.walkSteps >= 1, "Rocket Hideout player walks out (scriptMove, not a jump-cut)")
-    eq(#warpCalls, 1, "Rocket Hideout rewritten warp fires once, after the walk-out")
+    eq(#warpCalls, 0, "Rocket Hideout ride never warps on its own")
+    ow:takeWarp(ow.map.def.warps[1])
+    eq(#warpCalls, 1, "Rocket Hideout walking out takes the rewritten warp")
     if warpCalls[1] then
       eq(warpCalls[1].map, chosen.value.map, "Rocket Hideout walk-out lands on the chosen floor map")
       eq(warpCalls[1].x, chosen.value.x, "Rocket Hideout walk-out lands on the chosen floor x")

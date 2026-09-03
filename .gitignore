@@ -1,10 +1,15 @@
-# Generated from a user-provided Pokemon Red ROM.
-# Regenerate with: python3 tools/build_data.py --rom /path/to/pokemon-red.gb --clean
+# Generated from a user-provided Pokemon ROM (Red/Blue/Yellow/Gold/Silver/Crystal).
+# Regenerate with: python3 tools/build_data.py --rom /path/to/rom.gb --clean
+# Yellow Surfing Pikachu minigame art also lands here on import:
+#   assets/generated/minigame/surf_1{a,b,c}.png
+#   assets/generated/minigame/title_bg.png
+#   assets/generated/minigame/intro_pika_{0,1,2,3}.png
 data/generated/
 assets/generated/
 
-# LÖVE packages
+# LÖVE packages & archives
 *.love
+*.zip
 
 # Local saves (LÖVE writes to its save dir, but keep the repo clean anyway)
 save/
@@ -16,6 +21,7 @@ __pycache__/
 .*
 !.github/
 !.gitignore
+!.luacheckrc
 
 # Android build outputs / local SDK path / packaged payload (keep love-android sources)
 mobile/android/app/build/
@@ -30,8 +36,59 @@ mobile/ios/love-src/
 mobile/ios/cache/
 mobile/ios/build/
 
-# Final packaged build artifacts (mac/win/web/android/ios) — see scripts/build.sh
+# love-nx vendor binaries (fetch per docs/switch-build.md; also covered by .*)
+.bazinga/love-nx/
+
+# Final packaged build artifacts (mac/win/web/android/ios/switch) — see scripts/build.sh
 /dist/
+
+# Switch OTA launcher build outputs
+ports/switch/ota-launcher/build/
+ports/switch/ota-launcher/build-host/
+ports/switch/ota-launcher/*.nro
+ports/switch/ota-launcher/*.nacp
+ports/switch/ota-launcher/*.elf
+ports/switch/ota-launcher/*.map
+ports/switch/ota-launcher/romfs/logo.rgba
+ports/switch/ota-launcher/romfs/logo.png
+ports/switch/ota-launcher/romfs/cacert.pem
+ports/switch/ota-launcher/romfs/ota-bootstrap.nro
+ports/switch/ota-bootstrap/build/
+ports/switch/ota-bootstrap/*.nro
+ports/switch/ota-bootstrap/*.nacp
+ports/switch/ota-bootstrap/*.elf
+ports/switch/ota-bootstrap/*.map
 
 # Legacy manual convenience-copy location (superseded by /dist/android/)
 mobile/dist/
+
+# Tiled map-editing workspace (tools/tiled_export.py). Derived from the imported
+# ROM cache exactly like data/generated/, so it is never committable.
+/build/tiled/
+
+# Local visual scratch from minigame development (not wired to CI).
+/tests/fixtures/
+
+# per-machine iOS bundle-id pin (see scripts/build_ios.sh)
+mobile/ios/bundle_id.local
+
+# Xbox UWP build output
+/ports/uwp/build/
+/ports/uwp/third_party/*/source/
+/ports/uwp/third_party/angle/depot_tools/
+
+# Native TLS dialer build output (dotnet publish)
+/native/tls_dial/bin/
+/native/tls_dial/obj/
+/dist/native/
+/dist/win/
+/.bazinga/
+
+# Local options / preferences
+/options.lua*
+
+# User-owned ROMs imported for individual mods. Manifests declare the
+# destinations, but source checkouts and packaged mods never ship the files.
+/mods/*/baseroms/
+/imports/baseroms/
+/imports/baseroms-recovery/

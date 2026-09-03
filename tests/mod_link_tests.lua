@@ -21,6 +21,7 @@ local Net = require("src.link.Net")
 local Pokemon = require("src.pokemon.Pokemon")
 local Protocol = require("src.link.Protocol")
 local Runtime = require("src.mods.Runtime")
+local Session = require("src.link.Session")
 
 local S = require("tests.harness").suite("mod link")
 local check, eq = S.check, S.eq
@@ -212,6 +213,49 @@ eq(Handshake.mods(overhaulGame)[1].affectsLink, true, "and rides the hello")
 eq(Handshake.hello(tweakGame, "trade").linkModified, true,
    "the hello carries the flag a v1 peer is judged against")
 
+-- #501: a declared translation is invisible to the wire, so online play
+-- lets an English install meet a Spanish one
+local languageGame = loadMods({
+  ["mods/espanol/manifest.json"] =
+    '{"id":"espanol","name":"espanol","version":"1.0.0","entry":"main.lua",' ..
+    '"language":true,"category":"LANGUAGE"}',
+  ["mods/espanol/main.lua"] = [[
+return function(mod)
+  mod.content.strings:override("But, it failed!", "Pero fallo!")
+end
+]],
+})
+eq(Handshake.mods(languageGame)[1].language, true,
+   "the translation flag rides the hello")
+eq(Handshake.mods(languageGame)[1].affectsLink, false,
+   "and a translation never claims the fingerprint")
+eq(Handshake.linkModified(languageGame), false,
+   "it leaves the link surface alone")
+eq(Handshake.onlineAllowed(languageGame), true, "so online play allows it")
+eq(Fingerprint.compute(languageGame.data, Handshake.mods(languageGame)),
+   Fingerprint.compute(languageGame.data, {}),
+   "and two peers reading different languages hash the same")
+eq(Handshake.onlineAllowed(tweakGame), false,
+   "a content mod that touches a species still forces vanilla")
+eq(Handshake.onlineAllowed(bareGame), true, "vanilla still goes online")
+
+-- the flag is a claim, not a pass: a mod that writes gameplay is not a
+-- translation however its manifest describes itself
+local fakeLanguageGame = loadMods({
+  ["mods/faux/manifest.json"] =
+    '{"id":"faux","name":"faux","version":"1.0.0","entry":"main.lua","language":true}',
+  ["mods/faux/main.lua"] = [[
+return function(mod)
+  mod.content.strings:override("But, it failed!", "It worked!")
+  mod.content.pokemon:patch("PIKA", { baseStats = { attack = 200 } })
+end
+]],
+})
+eq(Handshake.onlineAllowed(fakeLanguageGame), false,
+   "a self-declared translation that patches a species is still blocked")
+eq(#Handshake.onlineBlockers(fakeLanguageGame), 1,
+   "and the mod manager restart prompt names it")
+
 -- ------- builtin records are private per dataset
 
 -- two independent loads must not share record tables: an edit through one
@@ -334,6 +378,25 @@ check(not Handshake.strict(nil), "no verdict keeps the v1 unpack path")
 local nextEngine = Handshake.hello(fakeGame(vanilla, "BLUE"), nil)
 nextEngine.engineVersion = "2.0.0"
 eq(Handshake.checkCompat(helloA, nextEngine), "refused", "engine major mismatch refuses")
+
+-- same major, different release: the fingerprint can't see engine code,
+-- and battle logic changes between releases, so lockstep would desync a
+-- few turns in (#758) -- battle is refused up front, trade still works
+local skewed = Handshake.hello(fakeGame(vanilla, "BLUE"), nil)
+skewed.engineVersion = (tostring(helloA.engineVersion):match("^(%d+)") or "0") .. ".999.0"
+local skewVerdict, skewReason = Handshake.checkCompat(helloA, wire(skewed))
+eq(skewVerdict, "engine_skew", "same-major release skew is its own verdict")
+eq(skewReason, "engine_release_mismatch", "and says why")
+check(not Handshake.battleAllowed("engine_skew"), "release skew refuses lockstep")
+check(Handshake.tradeAllowed("engine_skew"), "release skew still trades")
+check(Handshake.strict("engine_skew"), "release skew negotiates strictly")
+local skewLines = Handshake.describe(helloA, wire(skewed), "engine_skew", "battle")
+local skewJoined = table.concat(skewLines, " ")
+check(skewJoined:find("version", 1, true) ~= nil, "skew notice mentions versions")
+check(skewJoined:find("999", 1, true) ~= nil, "skew notice names the peer release")
+for _, line in ipairs(skewLines) do
+  check(#line <= 20, "skew line fits the screen: " .. line)
+end
 
 local lines = Handshake.describe(helloA, wire(helloMod), "subset", "battle")
 check(#lines > 0, "the incompatibility screen has something to say")
@@ -467,11 +530,19 @@ local function linkGame(name, species, data)
   return { data = data or Data, save = save, stack = stack, input = mkInput() }
 end
 
+-- LinkState talks to a Session, not to a raw transport (src/link/LinkState.lua
+-- :75 wraps every backend the same way), so a loopback end has to be wrapped
+-- here too or :update reaches for a getStatus the transport does not have.
+local function linkSession(transport, role)
+  return Session.new(transport, { role = role, kind = "link" })
+end
+
 -- two paired states, host already listening and guest already dialling
 local function pairStates(gameA, gameB)
   local netA, netB = Net.loopbackPair()
   local host, guest = LinkState.new(gameA), LinkState.new(gameB)
-  host.net, guest.net = netA, netB
+  host.net = linkSession(netA, "host")
+  guest.net = linkSession(netB, "guest")
   host.stage, guest.stage = "hosting", "joining"
   gameA.stack:push(host)
   gameB.stack:push(guest)
@@ -511,7 +582,7 @@ check(host.trade.strict, "a v2 verdict unpacks strictly")
 local gameOld = linkGame("RED", "PIDGEY")
 local oldNet, peerNet = Net.loopbackPair()
 local v1guest = LinkState.new(gameOld)
-v1guest.net = oldNet
+v1guest.net = linkSession(oldNet, "guest")
 v1guest.stage = "joining"
 gameOld.stack:push(v1guest)
 v1guest:update(1 / 60)
@@ -529,7 +600,7 @@ check(not v1guest.trade.strict, "the v1 path keeps the old unpack rules")
 local gameLone = linkGame("RED", "PIDGEY")
 local loneNet, silentNet = Net.loopbackPair()
 local v1host = LinkState.new(gameLone)
-v1host.net = loneNet
+v1host.net = linkSession(loneNet, "host")
 v1host.stage = "hosting"
 gameLone.stack:push(v1host)
 v1host:update(1 / 60)
