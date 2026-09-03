@@ -78,6 +78,13 @@ function LogicalRes.scaleFor(pw, ph)
   return math.max(1, math.floor(math.min(pw / bw, ph / bh)))
 end
 
+-- Whether a fixed logical frame is in force.  Callers that must not draw at a
+-- fractional scale (endFrame's fill override) gate on this the same way they
+-- gate on the FAITHFUL RATIO cap.
+function LogicalRes.active()
+  return LogicalRes.base() ~= nil
+end
+
 function LogicalRes.applyOptions(opts)
   LogicalRes.mode = LogicalRes.normalize(opts and opts.logicalRes)
   return LogicalRes.mode

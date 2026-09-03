@@ -54,6 +54,16 @@ eq(LogicalRes.cycle("auto", 1), "320x240", "cycle forward")
 eq(LogicalRes.cycle("320x240", 1), "auto", "cycle wraps")
 eq(LogicalRes.cycle("auto", -1), "320x240", "cycle backward wraps")
 
+-- The fill override (title screen / intro / BATTLE SIZE "fill") draws at a
+-- FRACTIONAL scale to reach the window edge, which breaks the one promise
+-- this setting makes.  Renderer:endFrame gates that override on
+-- LogicalRes.active the same way it gates on the FAITHFUL RATIO cap, so the
+-- flag has to answer true for a base and false for auto.
+LogicalRes.applyOptions({ logicalRes = "320x240" })
+eq(LogicalRes.active(), true, "a base suppresses the fractional fill")
+LogicalRes.applyOptions({})
+eq(LogicalRes.active(), false, "auto leaves the fill alone")
+
 -- leave the module on the default for suites sharing it
 LogicalRes.applyOptions({})
 

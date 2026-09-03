@@ -841,7 +841,12 @@ function Renderer:frameRects()
   -- GB pixel stops being a whole number of screen pixels, which is the trade
   -- the setting exists to offer.  Clamped on the horizontal too, so a narrow
   -- window scales to fit instead of overflowing off both sides.
-  if self.uiFill and not FaithfulRes.scaleCap() then
+  -- LOGICAL RES suppresses the fill for the same reason the FAITHFUL RATIO
+  -- cap does: both promise that a logical pixel is a whole multiple of screen
+  -- pixels everywhere, and a fractional fill breaks that on exactly the
+  -- screens that opt in -- the title and the intro, which then sat at a
+  -- different (and non-integer) scale from the map behind every other state.
+  if self.uiFill and not FaithfulRes.scaleCap() and not LogicalRes.active() then
     Up = math.min(ph / uih, pw / uiw)
   end
   if uiw * Up > pw or uih * Up > ph then
