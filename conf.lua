@@ -7,6 +7,21 @@ function love.conf(t)
   local editor = os.getenv("POKEPORT_EDITOR") == "1"
   local developer = os.getenv("POKEPORT_DEV") == "1"
   local companion = nil
+
+  -- --window=WxH / POKEPORT_WINDOW=WxH: open at an exact window size.  The
+  -- size has to be decided HERE, before the window exists -- love.load is
+  -- already too late to open at a size rather than resize to one, and on
+  -- Wayland there is no external tool to resize it afterwards either.  Testing
+  -- LOGICAL RES needs exact multiples of the logical frame (640x480, 960x720,
+  -- 1280x960), and hitting those by dragging is not a thing.
+  -- WindowSize has zero requires, so it is loadable this early; a checkout
+  -- where it is missing just keeps the default size.
+  local okWin, WindowSize = pcall(require, "src.core.WindowSize")
+  local winW, winH
+  if okWin then
+    winW, winH = WindowSize.request(arg, os.getenv("POKEPORT_WINDOW"))
+  end
+
   if arg then
     for _, a in ipairs(arg) do
       if a == "--editor" then editor = true end
@@ -60,6 +75,14 @@ function love.conf(t)
     -- (fullscreen), so the handheld ports are unaffected.
     t.window.minwidth = 480
     t.window.minheight = 360
+  end
+  -- Applied after every branch so it overrides whichever one ran, and lowers
+  -- the floor with it: a requested size under minwidth/minheight would
+  -- otherwise be clamped straight back up by LOVE and silently ignored.
+  if winW then
+    t.window.width, t.window.height = winW, winH
+    t.window.minwidth = math.min(t.window.minwidth or winW, winW)
+    t.window.minheight = math.min(t.window.minheight or winH, winH)
   end
   t.version = love._os == "iOS" and "12.0" or "11.5"
   -- Driver vsync stays on everywhere (including KMSDRM handhelds) so
