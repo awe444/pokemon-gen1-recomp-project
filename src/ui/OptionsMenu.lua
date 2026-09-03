@@ -23,6 +23,7 @@ local GameVersion = require("src.core.GameVersion")
 local VideoMode = require("src.core.VideoMode")
 local Orientation = require("src.core.Orientation")
 local FaithfulRes = require("src.core.FaithfulRes")
+local LogicalRes = require("src.render.LogicalRes")
 local ScreenPosition = require("src.core.ScreenPosition")
 local FrameCap = require("src.core.FrameCap")
 local VSync = require("src.core.VSync")
@@ -468,6 +469,20 @@ local function buildRows(game)
         local o = g.save.options
         o.faithfulRes = FaithfulRes.cycle(o.faithfulRes, dir)
         FaithfulRes.apply(o.faithfulRes)
+        return true
+      end },
+    -- Scale the whole picture off a fixed logical frame rather than off how
+    -- many whole 160x144 screens the window happens to hold, so an exact
+    -- multiple of that frame renders at exactly that multiple and the world
+    -- view is the frame (src/render/LogicalRes.lua).
+    { id = "logicalRes", label = Strings("LOGICAL RES"),
+      value = function(g)
+        return Strings(LogicalRes.label(g.save.options.logicalRes))
+      end,
+      step = function(g, dir)
+        local o = g.save.options
+        o.logicalRes = LogicalRes.cycle(o.logicalRes, dir)
+        LogicalRes.applyOptions(o)
         return true
       end },
     { id = "screenPos", label = Strings("SCREEN POS"),

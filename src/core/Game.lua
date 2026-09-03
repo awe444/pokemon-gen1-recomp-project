@@ -1330,6 +1330,7 @@ function Game:applyOptions(opts)
   -- after VideoMode: a faithful-resolution lock is an exact window size, so
   -- it has to be the last word on the window (it drops fullscreen to hold)
   require("src.core.FaithfulRes").applyOptions(opts)
+  require("src.render.LogicalRes").applyOptions(opts)
   require("src.core.ScreenPosition").applyOptions(opts)
   require("src.core.VSync").applyOptions(opts)
   require("src.core.FrameCap").applyOptions(opts)

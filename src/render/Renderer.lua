@@ -15,6 +15,7 @@ local Runtime = require("src.mods.Runtime")
 local GameViewport = require("src.render.GameViewport")
 -- leaf module (no renderer dependency), so requiring it here cannot cycle
 local FaithfulRes = require("src.core.FaithfulRes")
+local LogicalRes = require("src.render.LogicalRes")
 local ScreenPosition = require("src.core.ScreenPosition")
 local Playfield = require("src.render.Playfield")
 
@@ -161,7 +162,13 @@ end
 function Renderer:fitScale()
   local _, _, pw, ph = displayMetrics()
   local w, h = self:uiSize()
-  local s = math.max(1, math.floor(math.min(pw / w, ph / h)))
+  -- LOGICAL RES: scale against a fixed logical frame rather than the 160x144
+  -- UI, so a window that is an exact multiple of that frame renders at
+  -- exactly that multiple and the world view is the frame itself.  Everything
+  -- downstream -- uiScale, worldViewSize, the letterbox origin -- reads this
+  -- one number, so the whole picture shares the scale (src/render/LogicalRes).
+  local s = LogicalRes.scaleFor(pw, ph)
+    or math.max(1, math.floor(math.min(pw / w, ph / h)))
   -- FAITHFUL RATIO on mobile locks the scale here rather than by resizing the
   -- window, which a phone does not have (see src/core/FaithfulRes.lua).  The
   -- cap is the largest WHOLE multiple the display holds, so the picture is as
